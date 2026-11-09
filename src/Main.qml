@@ -184,6 +184,7 @@ Window {
 
                 ListView {
                     id: list
+                    objectName: "list"
                     anchors.fill: parent
                     visible: win.hasMessages
                     clip: true
@@ -201,7 +202,7 @@ Window {
 
                     // Stays pinned to the newest text until the user scrolls away.
                     property bool follow: true
-                    readonly property real endY: Math.max(0, contentHeight + bottomMargin - height)
+                    readonly property real endY: Math.max(originY - topMargin, originY + contentHeight + bottomMargin - height)
                     onContentHeightChanged: if (follow) {
                         glide.stop()
                         glide.to = endY
@@ -213,7 +214,6 @@ Window {
 
                     delegate: Item {
                         id: row
-                        required property int index
                         width: list.width
                         height: message.implicitHeight
                         Message {
@@ -225,7 +225,7 @@ Window {
                             markdown: model.display
                             phase: model.state
                             error: backend.errorText
-                            isLast: row.index === list.count - 1
+                            isLast: index === list.count - 1
                         }
                     }
                 }
