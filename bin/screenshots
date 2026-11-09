@@ -1,0 +1,14 @@
+#!/bin/sh
+# Rebuilds the README screenshots from the real QML, offscreen, with made-up content.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+mkdir -p "$ROOT/build/screenshots" "$ROOT/docs"
+cd "$ROOT/build/screenshots"
+
+qmake6 "$ROOT/tests/screenshots/screenshots.pro"
+make -j"$(nproc)"
+for scenario in selection screen models answer; do
+  QT_SCALE_FACTOR=2 QT_FORCE_STDERR_LOGGING=1 ./ask_screenshots "$scenario" "$ROOT/docs/$scenario.png"
+done
+echo "Wrote $ROOT/docs/"

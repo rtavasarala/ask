@@ -27,6 +27,12 @@ namespace {
 QElapsedTimer startup;
 bool tracing = false;
 
+// Wall-clock time of an event, so a shell can subtract its own start time.
+void traceEpoch(const char *what) {
+    if (tracing)
+        std::fprintf(stderr, "ask-trace: %s at %lld ms epoch\n", what, static_cast<long long>(QDateTime::currentMSecsSinceEpoch()));
+}
+
 void trace(const char *what, qint64 since) {
     if (tracing)
         std::fprintf(stderr, "ask-trace: %s %lld ms\n", what, static_cast<long long>(since));
@@ -80,7 +86,7 @@ int main(int argc, char *argv[]) {
 
     QGuiApplication app(argc, argv);
     app.setApplicationName("ask");
-    app.setApplicationVersion("0.1.0");
+    app.setApplicationVersion("0.2.0");
     // Hiding the window keeps the conversation and the warm process.
     app.setQuitOnLastWindowClosed(false);
     app.setDesktopFileName("ask");
@@ -122,7 +128,10 @@ int main(int argc, char *argv[]) {
         afterNextFrame(window, [] { trace("first frame", startup.elapsed()); });
 
     instance.setVisibleProbe([window] { return window->isVisible(); });
-    QObject::connect(&instance, &Instance::hideRequested, window, [window] { window->hide(); });
+    QObject::connect(&instance, &Instance::hideRequested, window, [window] {
+        window->hide();
+        traceEpoch("hidden");
+    });
     QObject::connect(&instance, &Instance::showRequested, window, [window, present, &backend](const std::optional<Context> &context) {
         QElapsedTimer since;
         since.start();
@@ -130,8 +139,7 @@ int main(int argc, char *argv[]) {
         if (tracing)
             afterNextFrame(window, [since] {
                 trace("show to frame", since.elapsed());
-                std::fprintf(stderr, "ask-trace: frame at %lld ms epoch\n",
-                             static_cast<long long>(QDateTime::currentMSecsSinceEpoch()));
+                traceEpoch("frame");
             });
         present();
     });

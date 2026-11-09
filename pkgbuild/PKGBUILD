@@ -1,12 +1,12 @@
 # Maintainer: kagehiko
 # Runtime requirement: the `fx` CLI (https://fx.sh), installed and signed in. It is not a pacman package.
 pkgname=ask
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc='Raycast-style Ask AI popup for Omarchy, backed by the fx CLI'
+pkgdesc='A fast, lightweight AI popup for Omarchy, backed by the fx CLI'
 arch=('x86_64' 'aarch64')
 license=('MIT')
-depends=('qt6-base' 'qt6-declarative' 'qt6-wayland')
+depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'grim' 'wl-clipboard')
 makedepends=('gcc' 'make')
 source=()
 sha256sums=()

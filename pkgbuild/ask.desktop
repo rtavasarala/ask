@@ -2,8 +2,8 @@
 Type=Application
 Name=Ask
 Name[da]=Spørg
-Comment=Ask AI anything
-Comment[da]=Spørg AI om hvad som helst
+Comment=Quick AI access
+Comment[da]=Hurtig adgang til AI
 Exec=ask
 Icon=ask
 Terminal=false
