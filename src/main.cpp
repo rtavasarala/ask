@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <utility>
 
 #include "backend.h"
 #include "instance.h"
@@ -28,10 +29,15 @@ void trace(const char *what, qint64 since) {
         std::fprintf(stderr, "ask-trace: %s %lld ms\n", what, static_cast<long long>(since));
 }
 
-// Calls `then` once, after the next frame reaches the screen.
+// Calls `then` once, after the next frame reaches the screen. frameSwapped is
+// emitted on the render thread, so several queued calls can arrive before the
+// disconnect lands; the flag keeps only the first.
 void afterNextFrame(QQuickWindow *window, std::function<void()> then) {
     auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = QObject::connect(window, &QQuickWindow::frameSwapped, window, [connection, then] {
+    auto fired = std::make_shared<bool>(false);
+    *connection = QObject::connect(window, &QQuickWindow::frameSwapped, window, [connection, fired, then] {
+        if (std::exchange(*fired, true))
+            return;
         QObject::disconnect(*connection);
         then();
     });

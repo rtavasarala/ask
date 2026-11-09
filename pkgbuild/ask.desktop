@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ask
+Name[da]=Spørg
+Comment=Ask AI anything
+Comment[da]=Spørg AI om hvad som helst
+Exec=ask
+Icon=ask
+Terminal=false
+Categories=Utility;
+StartupWMClass=ask
