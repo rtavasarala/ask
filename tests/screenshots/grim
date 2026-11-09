@@ -1,0 +1,4 @@
+#!/bin/sh
+# Writes a plain placeholder instead of capturing a real window.
+for last; do :; done
+cp "$(dirname "$0")/window.jpg" "$last" 2>/dev/null || printf 'x' > "$last"

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Stands in for fx so screenshots never reach a model.
+if [ "$1" = models ]; then
+  echo "[models] 6 available"
+  for m in anthropic/claude-sonnet-5.5 anthropic/claude-opus-5.5 anthropic/claude-haiku-4.5 openai/gpt-5 google/gemini-3-pro xai/grok-4; do echo " - $m"; done
+  exit 0
+fi
+cat <<'ANSWER'
+The committee wants to **delay the migration to Q2** so the new authentication flow can get a security review first.
+
+- **Why:** the review could change the token format.
+- **Risk:** a rushed rollout would force a second migration.
+- **Next step:** schedule the review before the Q2 planning meeting.
+
+```sh
+git log --oneline --since=2026-01-01 -- auth/
+```
+ANSWER

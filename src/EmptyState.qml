@@ -1,19 +1,21 @@
 import QtQuick
 import Ask
 
-// Quiet first-run hint with a few prompts to pick with the arrow keys or the mouse.
+// Quiet hint with a few prompts or AI commands to pick with the arrow keys or the mouse.
 Item {
     id: root
-    property var examples: []
+    property var items: []
+    property string hint: ""
     property int selected: -1
     signal picked(int index)
 
     Column {
         anchors.centerIn: parent
         width: Math.min(parent.width - Palette.unit * 6, 420)
-        spacing: Palette.unit
+        spacing: 2
 
         Text {
+            visible: root.items.length <= 4
             anchors.horizontalCenter: parent.horizontalCenter
             text: "✦"
             color: Palette.faint
@@ -21,18 +23,19 @@ Item {
         }
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: qsTr("Ask a question and the answer streams in here.")
+            text: root.hint
             color: Palette.dim
             font.pixelSize: 13
+            topPadding: root.items.length <= 4 ? Palette.unit : 0
             bottomPadding: Palette.unit
         }
         Repeater {
-            model: root.examples
+            model: root.items
             delegate: Rectangle {
                 required property string modelData
                 required property int index
                 width: parent.width
-                height: 32
+                height: 30
                 radius: Math.min(6, theme.radius)
                 color: index === root.selected ? Palette.selected : "transparent"
                 Text {

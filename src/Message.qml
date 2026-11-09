@@ -17,6 +17,8 @@ Item {
     // text streams in and delegates are not rebuilt per chunk.
     readonly property var parts: markdown.split(/^```[^\n]*\n?/m)
 
+    property string note
+
     implicitHeight: kind === "user" ? userLine.implicitHeight + 8 : answer.implicitHeight + 8
 
     Row {
@@ -33,12 +35,25 @@ Item {
             topPadding: 2
             width: 28
         }
-        Text {
+        Column {
             width: parent.width - tag.width - parent.spacing
-            text: root.raw
-            color: Palette.dim
-            font.pixelSize: 13
-            wrapMode: Text.Wrap
+            spacing: 2
+            Text {
+                width: parent.width
+                text: root.raw
+                color: Palette.dim
+                font.pixelSize: 13
+                wrapMode: Text.Wrap
+            }
+            Text {
+                visible: root.note.length > 0
+                width: parent.width
+                text: "＋ " + root.note
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                color: Palette.faint
+                font.pixelSize: 11
+            }
         }
     }
 

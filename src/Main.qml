@@ -17,6 +17,9 @@ Window {
     readonly property bool hasMessages: backend.messages.count > 0
     property bool helpVisible: false
     property int exampleIndex: -1
+    property string panelMode: "actions"
+    readonly property bool commandMode: backend.attachments.hasEnabledSelection
+    readonly property var commandList: backend.commands()
     readonly property bool actionsOpen: actionsLoader.item !== null && actionsLoader.item.visible
 
     readonly property var examples: [
@@ -24,6 +27,11 @@ Window {
         qsTr("Write a regex that matches ISO 8601 dates"),
         qsTr("What is the difference between a mutex and a semaphore?")
     ]
+
+    // What the empty state offers: AI commands for a selection, else example prompts.
+    readonly property var emptyItems: commandMode ? commandList.map(c => qsTr(c.title)) : examples
+    readonly property string emptyHint: commandMode ? qsTr("Choose what to do with the selected text.")
+                                                    : qsTr("Ask a question and the answer streams in here.")
 
     readonly property var actionItems: {
         const items = []
@@ -33,8 +41,26 @@ Window {
             items.push({id: "copyAnswer", label: qsTr("Copy Answer"), keys: ["Ctrl", "Shift", "C"]})
         if (hasMessages)
             items.push({id: "copyQuestion", label: qsTr("Copy Question"), keys: []})
+        if (commandMode)
+            for (const c of commandList)
+                items.push({id: "command:" + c.id, label: qsTr(c.title), keys: []})
+        if (backend.attachments.hasScreen)
+            items.push({id: "screen", keys: ["Ctrl", "S"],
+                        label: backend.attachments.screenEnabled ? qsTr("Remove Window Screenshot") : qsTr("Attach Window Screenshot")})
+        items.push({id: "changeModel", label: qsTr("Change Model…"), keys: []})
         items.push({id: "newChat", label: qsTr("New Chat"), keys: ["Ctrl", "N"]})
         items.push({id: "shortcuts", label: qsTr("Keyboard Shortcuts"), keys: ["F1"]})
+        return items
+    }
+
+    readonly property var modelItems: {
+        const items = [{id: "model:", label: qsTr("Default (fx)"), keys: [], checked: backend.model === ""}]
+        if (backend.modelsState === Backend.ModelsLoading)
+            items.push({id: "wait", label: qsTr("Loading models…"), keys: []})
+        else if (backend.modelsState === Backend.ModelsFailed)
+            items.push({id: "retry", label: qsTr("Could not load models. Enter to retry."), keys: []})
+        for (const m of backend.models)
+            items.push({id: "model:" + m, label: m, keys: [], checked: m === backend.model})
         return items
     }
 
@@ -43,6 +69,8 @@ Window {
     }
 
     function runAction(id) {
+        if (id === "wait")
+            return
         if (actionsLoader.item)
             actionsLoader.item.close()
         if (id === "stop") backend.stop()
@@ -50,9 +78,33 @@ Window {
         else if (id === "copyQuestion") backend.copyLastQuestion()
         else if (id === "newChat") newChat()
         else if (id === "shortcuts") helpVisible = true
+        else if (id === "screen") backend.toggleScreen()
+        else if (id === "changeModel") openModels()
+        else if (id === "retry") { backend.loadModels(); openModels() }
+        else if (id.startsWith("model:")) backend.setModel(id.slice(6))
+        else if (id.startsWith("command:")) runCommand(id.slice(8))
+    }
+
+    function runCommand(id) {
+        list.follow = true
+        if (backend.runCommand(id))
+            exampleIndex = -1
+    }
+
+    function pickEmpty(index) {
+        if (commandMode) runCommand(commandList[index].id)
+        else submit(examples[index])
     }
 
     function openActions() {
+        panelMode = "actions"
+        actionsLoader.active = true
+        actionsLoader.item.open()
+    }
+
+    function openModels() {
+        panelMode = "models"
+        backend.loadModels()
         actionsLoader.active = true
         actionsLoader.item.open()
     }
@@ -67,12 +119,15 @@ Window {
         if (win.running || text.trim().length === 0)
             return
         list.follow = true
-        backend.send(text)
-        input.clear()
-        exampleIndex = -1
+        // Refused while a chip is still capturing; the text stays for another Enter.
+        if (backend.send(text)) {
+            input.clear()
+            exampleIndex = -1
+        }
     }
 
     Shortcut { sequence: "Ctrl+K"; context: Qt.ApplicationShortcut; onActivated: win.actionsOpen ? actionsLoader.item.close() : win.openActions() }
+    Shortcut { sequence: "Ctrl+S"; context: Qt.ApplicationShortcut; onActivated: backend.toggleScreen() }
     Shortcut { sequence: "Ctrl+N"; context: Qt.ApplicationShortcut; onActivated: win.newChat() }
     Shortcut { sequence: "Ctrl+Shift+C"; context: Qt.ApplicationShortcut; onActivated: backend.copyLastAnswer() }
     Shortcut { sequence: "Ctrl+Q"; context: Qt.ApplicationShortcut; onActivated: Qt.quit() }
@@ -128,6 +183,7 @@ Window {
 
                     TextArea {
                         id: input
+                        objectName: "input"
                         focus: true
                         padding: 0
                         topPadding: 2
@@ -147,24 +203,40 @@ Window {
                             if (enter && !(event.modifiers & Qt.ShiftModifier)) {
                                 event.accepted = true
                                 if (text.length === 0 && !win.hasMessages && win.exampleIndex >= 0)
-                                    win.submit(win.examples[win.exampleIndex])
+                                    win.pickEmpty(win.exampleIndex)
                                 else
                                     win.submit(text)
+                            } else if (event.matches(StandardKey.Paste) && backend.pasteImage()) {
+                                event.accepted = true
+                            } else if (text.length === 0 && event.key === Qt.Key_Backspace && backend.removeLastAttachment()) {
+                                event.accepted = true
                             } else if (text.length === 0 && event.key === Qt.Key_Up) {
                                 event.accepted = true
                                 if (!win.hasMessages)
-                                    win.exampleIndex = win.exampleIndex <= 0 ? win.examples.length - 1 : win.exampleIndex - 1
+                                    win.exampleIndex = win.exampleIndex <= 0 ? win.emptyItems.length - 1 : win.exampleIndex - 1
                                 else {
                                     text = backend.lastQuestion()
                                     cursorPosition = text.length
                                 }
                             } else if (text.length === 0 && event.key === Qt.Key_Down && !win.hasMessages) {
                                 event.accepted = true
-                                win.exampleIndex = (win.exampleIndex + 1) % win.examples.length
+                                win.exampleIndex = (win.exampleIndex + 1) % win.emptyItems.length
                             }
                         }
                     }
                 }
+            }
+
+            AttachmentChips {
+                Layout.fillWidth: true
+                Layout.leftMargin: Palette.unit * 2 + 20 + Palette.unit * 1.5
+                Layout.rightMargin: Palette.unit * 2
+                Layout.bottomMargin: Palette.unit * 1.25
+                // Above the transcript so a chip's tooltip is not covered.
+                z: 5
+                visible: backend.attachments.count > 0
+                onToggled: row => backend.toggleAttachment(row)
+                onRemoved: row => { backend.removeAttachment(row); input.forceActiveFocus() }
             }
 
             Rectangle { Layout.fillWidth: true; height: 1; color: Palette.divider }
@@ -176,10 +248,11 @@ Window {
                 EmptyState {
                     anchors.fill: parent
                     visible: !win.hasMessages
-                    examples: win.examples
+                    items: win.emptyItems
+                    hint: win.emptyHint
                     selected: win.exampleIndex
                     onSelectedChanged: win.exampleIndex = selected
-                    onPicked: index => win.submit(win.examples[index])
+                    onPicked: index => win.pickEmpty(index)
                 }
 
                 ListView {
@@ -224,6 +297,7 @@ Window {
                             raw: model.text
                             markdown: model.display
                             phase: model.state
+                            note: model.note
                             error: backend.errorText
                             isLast: index === list.count - 1
                         }
@@ -250,6 +324,18 @@ Window {
                     color: Palette.dim
                     font.pixelSize: 12
                     font.weight: Font.Medium
+                }
+                Rectangle { width: 1; height: 16; color: Palette.divider }
+                Text {
+                    id: modelLabel
+                    Layout.maximumWidth: 180
+                    text: backend.modelLabel.length ? backend.modelLabel : qsTr("Default model")
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    color: modelHover.hovered ? Palette.text : Palette.faint
+                    font.pixelSize: 12
+                    HoverHandler { id: modelHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: win.openModels() }
                 }
                 StatusDot { visible: win.running; Layout.alignment: Qt.AlignVCenter }
                 Text {
@@ -280,13 +366,35 @@ Window {
         }
     }
 
+    DropArea {
+        id: drop
+        anchors.fill: parent
+        keys: ["text/uri-list"]
+        onDropped: event => { if (event.hasUrls) backend.addImageFiles(event.urls) }
+    }
+    Rectangle {
+        anchors.fill: parent
+        visible: drop.containsDrag
+        radius: theme.radius
+        color: Qt.alpha(theme.accent, 0.08)
+        border.color: theme.accent
+        Text {
+            anchors.centerIn: parent
+            text: qsTr("Drop images to attach")
+            color: theme.accent
+            font.pixelSize: 15
+        }
+    }
+
     Loader {
         id: actionsLoader
         anchors.fill: parent
         active: false
         source: "ActionsPanel.qml"
     }
-    Binding { target: actionsLoader.item; property: "actions"; value: win.actionItems; when: actionsLoader.item !== null }
+    Binding { target: actionsLoader.item; property: "actions"; value: win.panelMode === "models" ? win.modelItems : win.actionItems; when: actionsLoader.item !== null }
+    Binding { target: actionsLoader.item; property: "placeholder"; value: win.panelMode === "models" ? qsTr("Search for models…") : qsTr("Search for actions…"); when: actionsLoader.item !== null }
+    Binding { target: actionsLoader.item; property: "popoverWidth"; value: win.panelMode === "models" ? 380 : 280; when: actionsLoader.item !== null }
     Connections {
         target: actionsLoader.item
         function onTriggered(id) { win.runAction(id) }
@@ -304,6 +412,9 @@ Window {
                 {label: qsTr("Actions"), keys: ["Ctrl", "K"]},
                 {label: qsTr("New Chat"), keys: ["Ctrl", "N"]},
                 {label: qsTr("Copy Answer"), keys: ["Ctrl", "Shift", "C"]},
+                {label: qsTr("Attach window screenshot"), keys: ["Ctrl", "S"]},
+                {label: qsTr("Paste image"), keys: ["Ctrl", "V"]},
+                {label: qsTr("Remove last attachment"), keys: ["⌫"]},
                 {label: qsTr("Recall last question"), keys: ["↑"]},
                 {label: qsTr("Quit"), keys: ["Ctrl", "Q"]},
                 {label: qsTr("Keyboard Shortcuts"), keys: ["F1"]}

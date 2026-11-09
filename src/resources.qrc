@@ -7,6 +7,7 @@
         <file>StatusDot.qml</file>
         <file>EmptyState.qml</file>
         <file>ActionsPanel.qml</file>
+        <file>AttachmentChips.qml</file>
         <file>ShortcutsOverlay.qml</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="i18n/da.json">i18n/da.json</file>

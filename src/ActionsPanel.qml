@@ -5,8 +5,11 @@ import QtQuick.Controls.Basic
 // Raycast-style actions popover: type to filter, arrows to move, Enter to run.
 Item {
     id: root
-    // [{id, label, keys}]
+    // [{id, label, keys, checked?}]
     property var actions: []
+    property string placeholder: qsTr("Search for actions…")
+    property int popoverWidth: 280
+    readonly property int maxVisible: 8
     signal triggered(string id)
     signal dismissed
 
@@ -28,6 +31,7 @@ Item {
     }
 
     onVisibleChanged: if (!visible) dismissed()
+    onCurrentChanged: list.positionViewAtIndex(current, ListView.Contain)
 
     MouseArea {
         anchors.fill: parent
@@ -37,7 +41,7 @@ Item {
 
     Item {
         id: popover
-        width: 280
+        width: root.popoverWidth
         height: list.height + filterRow.height + 1 + Palette.unit
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -67,8 +71,9 @@ Item {
             x: Palette.unit / 2
             y: Palette.unit / 2
             width: parent.width - Palette.unit
-            height: Math.max(1, count) * root.rowHeight
+            height: Math.max(1, Math.min(count, root.maxVisible)) * root.rowHeight
             interactive: false
+            clip: true
             model: root.shown
             currentIndex: root.current
             delegate: Rectangle {
@@ -81,11 +86,24 @@ Item {
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     x: Palette.unit
+                    width: parent.width - Palette.unit * 2 - keysRow.width
                     text: modelData.label
+                    textFormat: Text.PlainText
+                    elide: Text.ElideMiddle
                     color: Palette.text
                     font.pixelSize: 13
                 }
+                Text {
+                    visible: modelData.checked === true
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.right: parent.right
+                    anchors.rightMargin: Palette.unit
+                    text: "✓"
+                    color: theme.accent
+                    font.pixelSize: 13
+                }
                 Row {
+                    id: keysRow
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.right: parent.right
                     anchors.rightMargin: Palette.unit
@@ -143,7 +161,8 @@ Item {
                 }
                 Text {
                     visible: !filter.text
-                    text: qsTr("Search for actions…")
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.placeholder
                     color: Palette.faint
                     font: filter.font
                 }

@@ -5,6 +5,12 @@ TARGET = ask
 TEMPLATE = app
 
 HEADERS += \
+    src/attachment.h \
+    src/attachmentsmodel.h \
+    src/commands.h \
+    src/context.h \
+    src/prompt.h \
+    src/settings.h \
     src/backend.h \
     src/instance.h \
     src/messagesmodel.h \
@@ -12,6 +18,12 @@ HEADERS += \
     src/translator.h
 
 SOURCES += \
+    src/attachment.cpp \
+    src/attachmentsmodel.cpp \
+    src/commands.cpp \
+    src/context.cpp \
+    src/prompt.cpp \
+    src/settings.cpp \
     src/main.cpp \
     src/backend.cpp \
     src/instance.cpp \

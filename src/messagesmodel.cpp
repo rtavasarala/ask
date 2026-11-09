@@ -15,12 +15,13 @@ QVariant MessagesModel::data(const QModelIndex &index, int role) const {
     case TextRole: return row.text;
     case DisplayRole: return row.display;
     case StateRole: return row.state;
+    case NoteRole: return row.note;
     }
     return {};
 }
 
 QHash<int, QByteArray> MessagesModel::roleNames() const {
-    return {{RoleRole, "role"}, {TextRole, "text"}, {DisplayRole, "display"}, {StateRole, "state"}};
+    return {{RoleRole, "role"}, {TextRole, "text"}, {DisplayRole, "display"}, {StateRole, "state"}, {NoteRole, "note"}};
 }
 
 QString MessagesModel::sanitize(const QString &markdown) {
@@ -37,10 +38,10 @@ QString MessagesModel::sanitize(const QString &markdown) {
     return out;
 }
 
-void MessagesModel::append(const QString &role, const QString &text, const QString &state) {
+void MessagesModel::append(const QString &role, const QString &text, const QString &state, const QString &note) {
     const bool hadText = lastHasText();
     beginInsertRows({}, m_rows.size(), m_rows.size());
-    m_rows.append({role, text, sanitize(text), state});
+    m_rows.append({role, text, sanitize(text), state, note});
     endInsertRows();
     emit countChanged();
     if (hadText != lastHasText())

@@ -11,7 +11,7 @@ class MessagesModel : public QAbstractListModel {
     Q_PROPERTY(bool lastHasText READ lastHasText NOTIFY lastHasTextChanged)
 
 public:
-    enum Roles { RoleRole = Qt::UserRole + 1, TextRole, DisplayRole, StateRole };
+    enum Roles { RoleRole = Qt::UserRole + 1, TextRole, DisplayRole, StateRole, NoteRole };
 
     explicit MessagesModel(QObject *parent = nullptr) : QAbstractListModel(parent) {}
 
@@ -23,7 +23,8 @@ public:
     // tags are dropped, so rendering never fetches a remote resource.
     static QString sanitize(const QString &markdown);
 
-    void append(const QString &role, const QString &text, const QString &state = {});
+    // `note` says what a question carried (a selection, a window), for display only.
+    void append(const QString &role, const QString &text, const QString &state = {}, const QString &note = {});
     void appendToLast(const QString &chunk);
     void setLastState(const QString &state);
     void clear();
@@ -38,7 +39,7 @@ signals:
 
 private:
     struct Row {
-        QString role, text, display, state;
+        QString role, text, display, state, note;
     };
     QList<Row> m_rows;
 };

@@ -1,5 +1,6 @@
 // ask: a Raycast-style popup that asks `fx ask` a question and streams the answer.
 
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QIcon>
@@ -16,7 +17,9 @@
 #include <utility>
 
 #include "backend.h"
+#include "context.h"
 #include "instance.h"
+#include "settings.h"
 #include "theme.h"
 #include "translator.h"
 
@@ -54,11 +57,26 @@ int main(int argc, char *argv[]) {
             background = true;
 
     // Before the GUI exists, so a hotkey press that lands on a warm process
-    // costs one socket write and no platform plugin. `--background` only pings:
-    // autostarting twice must not toggle the window.
+    // costs a socket round trip and no platform plugin. `--background` only
+    // pings: autostarting twice must not toggle the window.
     Instance instance;
-    if (instance.notifyRunning(background ? "ping\n" : "toggle\n"))
-        return 0;
+    std::optional<Context> initial;
+    if (background) {
+        if (instance.pingRunning())
+            return 0;
+    } else {
+        const auto outcome = instance.toggleRunning([] {
+            QElapsedTimer gathering;
+            gathering.start();
+            const Context context = Context::gather();
+            trace("context gathered", gathering.elapsed());
+            return context;
+        });
+        if (outcome != Instance::NotRunning)
+            return 0;
+        // First launch: we are the instance, and the window has not stolen focus yet.
+        initial = Context::gather();
+    }
 
     QGuiApplication app(argc, argv);
     app.setApplicationName("ask");
@@ -76,7 +94,7 @@ int main(int argc, char *argv[]) {
     instance.listen();
 
     Theme theme;
-    Backend backend;
+    Backend backend({}, {}, Backend::Paths().withSettings(Settings::defaultPath()));
     qmlRegisterSingletonType(QUrl("qrc:/Palette.qml"), "Ask", 1, 0, "Palette");
     qmlRegisterUncreatableType<Backend>("Ask", 1, 0, "Backend", "Backend is provided by the application");
 
@@ -103,24 +121,28 @@ int main(int argc, char *argv[]) {
     if (tracing)
         afterNextFrame(window, [] { trace("first frame", startup.elapsed()); });
 
-    QObject::connect(&instance, &Instance::toggleRequested, window, [window, present] {
-        if (window->isVisible() && window->isActive()) {
-            window->hide();
-            return;
-        }
-        if (tracing) {
-            QElapsedTimer since;
-            since.start();
-            afterNextFrame(window, [since] { trace("toggle to frame", since.elapsed()); });
-        }
+    instance.setVisibleProbe([window] { return window->isVisible(); });
+    QObject::connect(&instance, &Instance::hideRequested, window, [window] { window->hide(); });
+    QObject::connect(&instance, &Instance::showRequested, window, [window, present, &backend](const std::optional<Context> &context) {
+        QElapsedTimer since;
+        since.start();
+        backend.applyContext(context);
+        if (tracing)
+            afterNextFrame(window, [since] {
+                trace("show to frame", since.elapsed());
+                std::fprintf(stderr, "ask-trace: frame at %lld ms epoch\n",
+                             static_cast<long long>(QDateTime::currentMSecsSinceEpoch()));
+            });
         present();
     });
 
     // Created but not shown, so the first toggle pays for as little as possible.
     if (background)
         window->create();
-    else
+    else {
+        backend.applyContext(initial);
         present();
+    }
 
     return app.exec();
 }
