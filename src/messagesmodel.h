@@ -7,6 +7,7 @@
 // `display` is what the view renders, after the sanitizer.
 class MessagesModel : public QAbstractListModel {
     Q_OBJECT
+    Q_PROPERTY(int count READ count NOTIFY countChanged)
     Q_PROPERTY(bool lastHasText READ lastHasText NOTIFY lastHasTextChanged)
 
 public:
@@ -32,6 +33,7 @@ public:
     QString lastText(const QString &role) const;
 
 signals:
+    void countChanged();
     void lastHasTextChanged();
 
 private:

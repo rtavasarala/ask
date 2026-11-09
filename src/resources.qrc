@@ -1,0 +1,14 @@
+<RCC>
+    <qresource prefix="/">
+        <file>Palette.qml</file>
+        <file>Main.qml</file>
+        <file>Message.qml</file>
+        <file>KeyCap.qml</file>
+        <file>StatusDot.qml</file>
+        <file>EmptyState.qml</file>
+        <file>ActionsPanel.qml</file>
+        <file>ShortcutsOverlay.qml</file>
+        <file alias="i18n/en.json">i18n/en.json</file>
+        <file alias="i18n/da.json">i18n/da.json</file>
+    </qresource>
+</RCC>

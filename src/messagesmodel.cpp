@@ -42,6 +42,7 @@ void MessagesModel::append(const QString &role, const QString &text, const QStri
     beginInsertRows({}, m_rows.size(), m_rows.size());
     m_rows.append({role, text, sanitize(text), state});
     endInsertRows();
+    emit countChanged();
     if (hadText != lastHasText())
         emit lastHasTextChanged();
 }
@@ -72,6 +73,7 @@ void MessagesModel::clear() {
     beginResetModel();
     m_rows.clear();
     endResetModel();
+    emit countChanged();
     if (hadText)
         emit lastHasTextChanged();
 }

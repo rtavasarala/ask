@@ -8,6 +8,7 @@ Instance::Instance(const QString &name, QObject *parent)
     connect(&m_server, &QLocalServer::newConnection, this, [this] {
         while (auto *socket = m_server.nextPendingConnection()) {
             connect(socket, &QLocalSocket::readyRead, this, [this, socket] {
+                // Any other message (a "ping") only proves the instance is alive.
                 if (socket->readAll().contains("toggle"))
                     emit toggleRequested();
                 socket->disconnectFromServer();

@@ -6,6 +6,7 @@
 #include <QGuiApplication>
 #include <QClipboard>
 #include <QProcessEnvironment>
+#include <memory>
 #include <QStandardPaths>
 #include <QTimer>
 
