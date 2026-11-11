@@ -145,6 +145,42 @@ QList<Attachment> AttachmentsModel::takeEnabled() {
     return taken;
 }
 
+void AttachmentsModel::restore(const QList<Attachment> &attachments) {
+    if (attachments.isEmpty())
+        return;
+    QList<Attachment> selections, screens, users;
+    for (Attachment a : attachments) {
+        if (a.id <= 0)
+            a.id = m_nextId++;
+        else
+            m_nextId = qMax(m_nextId, a.id + 1);
+        if (a.kind == Attachment::Selection)
+            selections << a;
+        else if (a.kind == Attachment::Screen)
+            screens << a;
+        else
+            users << a;
+    }
+    auto insertBatch = [this](int pos, const QList<Attachment> &batch) {
+        if (batch.isEmpty())
+            return;
+        beginInsertRows({}, pos, pos + batch.size() - 1);
+        for (int i = 0; i < batch.size(); ++i)
+            m_items.insert(pos + i, batch.at(i));
+        endInsertRows();
+    };
+    insertBatch(0, selections);
+    int afterSelections = 0;
+    while (afterSelections < m_items.size() && m_items.at(afterSelections).kind == Attachment::Selection)
+        ++afterSelections;
+    insertBatch(afterSelections, screens);
+    int firstUser = 0;
+    while (firstUser < m_items.size() && m_items.at(firstUser).isContext())
+        ++firstUser;
+    insertBatch(firstUser, users);
+    emit countChanged();
+}
+
 QList<Attachment> AttachmentsModel::clear() {
     const QList<Attachment> all = m_items;
     if (!all.isEmpty()) {

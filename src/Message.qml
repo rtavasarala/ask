@@ -7,17 +7,21 @@ Item {
     property string kind
     property string raw
     property string markdown
+    required property var blocks
     property string phase
     property string error
     property bool isLast: false
+    property string note
 
     readonly property bool streaming: phase === "streaming"
-    // Fenced code is split out so it can sit on its own background. Even
-    // parts are prose, odd parts are code, so a segment keeps its kind while
-    // text streams in and delegates are not rebuilt per chunk.
-    readonly property var parts: markdown.split(/^```[^\n]*\n?/m)
-
-    property string note
+    // Indexed by count so existing delegates stay alive while chunks stream in.
+    readonly property var effectiveBlocks: {
+        if (blocks && blocks.length > 0)
+            return blocks
+        if (markdown.length > 0)
+            return [{isCode: false, language: "", body: markdown.replace(/\n$/, "")}]
+        return []
+    }
 
     implicitHeight: kind === "user" ? userLine.implicitHeight + 8 : answer.implicitHeight + 8
 
@@ -41,6 +45,7 @@ Item {
             Text {
                 width: parent.width
                 text: root.raw
+                textFormat: Text.PlainText
                 color: Palette.dim
                 font.pixelSize: 13
                 wrapMode: Text.Wrap
@@ -64,14 +69,16 @@ Item {
         spacing: Palette.unit
 
         Repeater {
-            model: root.parts.length
+            model: root.effectiveBlocks.length
             delegate: Item {
                 id: part
                 required property int index
-                readonly property bool isCode: index % 2 === 1
-                readonly property string body: root.parts[index].replace(/\n$/, "")
-                readonly property bool last: index === root.parts.length - 1
-                visible: body.length > 0 || (isCode && !last)
+                readonly property var block: root.effectiveBlocks[index] || ({isCode: false, language: "", body: ""})
+                readonly property bool isCode: Boolean(block.isCode)
+                readonly property string language: block.language || ""
+                readonly property string body: block.body || ""
+                readonly property bool last: index === root.effectiveBlocks.length - 1
+                visible: isCode || body.length > 0
                 width: answer.width
                 height: visible ? (isCode ? codeBox.height : prose.implicitHeight) : -answer.spacing
 
@@ -95,18 +102,82 @@ Item {
                     id: codeBox
                     visible: part.isCode
                     width: parent.width
-                    height: code.implicitHeight + Palette.unit * 2
+                    height: code.y + code.implicitHeight + Palette.unit
                     radius: Math.min(6, theme.radius)
                     color: Palette.codeBackground
                     border.color: Palette.divider
 
+                    Item {
+                        id: codeHeader
+                        width: parent.width
+                        height: 26
+
+                        Text {
+                            x: Palette.unit + 2
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: Math.max(0, copyAction.x - x - Palette.unit)
+                            text: part.language.length > 0 ? part.language : qsTr("code")
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            color: Palette.faint
+                            font.family: Palette.mono
+                            font.pixelSize: 11
+                        }
+
+                        Item {
+                            id: copyAction
+                            property bool copied: false
+                            anchors.right: parent.right
+                            anchors.rightMargin: Palette.unit - 2
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: copyLabel.implicitWidth + Palette.unit * 1.5
+                            height: 20
+
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: Math.min(4, theme.radius)
+                                color: copyHover.hovered ? Palette.hover : "transparent"
+                            }
+                            Text {
+                                id: copyLabel
+                                anchors.centerIn: parent
+                                text: copyAction.copied ? ("✓ " + qsTr("Copied")) : qsTr("Copy")
+                                textFormat: Text.PlainText
+                                color: copyAction.copied ? theme.accent : (copyHover.hovered ? Palette.text : Palette.dim)
+                                font.pixelSize: 11
+                            }
+                            HoverHandler { id: copyHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler {
+                                enabled: part.body.length > 0
+                                onTapped: {
+                                    backend.copyText(part.body)
+                                    copyAction.copied = true
+                                    copiedTimer.restart()
+                                }
+                            }
+                            Timer {
+                                id: copiedTimer
+                                interval: 1200
+                                onTriggered: copyAction.copied = false
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        y: codeHeader.height
+                        width: parent.width
+                        height: 1
+                        color: Palette.divider
+                    }
+
                     TextEdit {
                         id: code
                         x: Palette.unit + 2
-                        y: Palette.unit
+                        y: codeHeader.height + 1 + Palette.unit
                         width: parent.width - Palette.unit * 2 - 4
                         readOnly: true
                         selectByMouse: true
+                        textFormat: TextEdit.PlainText
                         text: part.body
                         wrapMode: TextEdit.Wrap
                         color: Palette.text
@@ -125,8 +196,8 @@ Item {
                         return edit.positionToRectangle(edit.length)
                     }
                     visible: root.streaming && part.last
-                    x: (part.isCode ? code.x : 0) + end.x + 1
-                    y: (part.isCode ? code.y : 0) + end.y + 2
+                    x: (part.isCode ? codeBox.x + code.x : prose.x) + end.x + 1
+                    y: (part.isCode ? codeBox.y + code.y : prose.y) + end.y + 2
                     width: 2
                     height: Math.max(12, end.height - 4)
                     color: theme.accent
@@ -144,13 +215,38 @@ Item {
             visible: root.streaming && root.raw.length === 0
         }
 
-        Text {
+        Column {
             visible: root.phase === "failed" && root.isLast
             width: parent.width
-            text: root.error
-            color: Palette.danger
-            font.pixelSize: 13
-            wrapMode: Text.Wrap
+            spacing: 6
+
+            Text {
+                width: parent.width
+                text: root.error
+                textFormat: Text.PlainText
+                color: Palette.danger
+                font.pixelSize: 13
+                wrapMode: Text.Wrap
+            }
+
+            Rectangle {
+                width: retryLabel.implicitWidth + Palette.unit * 2
+                height: 24
+                radius: Math.min(6, theme.radius)
+                color: retryHover.hovered ? Palette.hover : "transparent"
+                border.color: retryHover.hovered ? Palette.dim : Palette.border
+
+                Text {
+                    id: retryLabel
+                    anchors.centerIn: parent
+                    text: qsTr("Retry")
+                    textFormat: Text.PlainText
+                    color: retryHover.hovered ? Palette.text : Palette.dim
+                    font.pixelSize: 12
+                }
+                HoverHandler { id: retryHover; cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: backend.regenerate() }
+            }
         }
     }
 }

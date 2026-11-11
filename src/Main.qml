@@ -19,8 +19,19 @@ Window {
     property int exampleIndex: -1
     property string panelMode: "actions"
     readonly property bool commandMode: backend.attachments.hasEnabledSelection
-    readonly property var commandList: backend.commands()
+    readonly property var commandList: {
+        translator.language
+        return backend.commandsForLanguage ? backend.commandsForLanguage(translator.language) : backend.commands()
+    }
     readonly property bool actionsOpen: actionsLoader.item !== null && actionsLoader.item.visible
+
+    Binding { target: Palette; property: "source"; value: theme }
+
+    Component.onCompleted: backend.setUiLanguage(translator.language)
+    Connections {
+        target: translator
+        function onChanged() { backend.setUiLanguage(translator.language) }
+    }
 
     readonly property var examples: [
         qsTr("Explain how TCP slow start works"),
@@ -28,8 +39,39 @@ Window {
         qsTr("What is the difference between a mutex and a semaphore?")
     ]
 
+    function commandTitle(c) {
+        if (c.targetLanguage && c.targetLanguage.length > 0)
+            return qsTr("Translate to %1").arg(c.targetLanguage)
+        if (c.isCustom)
+            return c.title
+        return qsTr(c.title)
+    }
+
+    function effortTitle(level) {
+        if (!level || level.length === 0) return qsTr("Default effort")
+        if (level === "low") return qsTr("Low")
+        if (level === "medium") return qsTr("Medium")
+        if (level === "high") return qsTr("High")
+        if (level === "max") return qsTr("Max")
+        return level
+    }
+
+    function formatChatTime(updatedAt) {
+        if (!updatedAt)
+            return ""
+        const stamp = typeof updatedAt === "number"
+            ? new Date(updatedAt < 1e12 ? updatedAt * 1000 : updatedAt)
+            : new Date(updatedAt)
+        if (isNaN(stamp.getTime()))
+            return String(updatedAt)
+        const now = new Date()
+        if (now.toDateString() === stamp.toDateString())
+            return Qt.formatTime(stamp, "HH:mm")
+        return Qt.formatDate(stamp, "MMM d")
+    }
+
     // What the empty state offers: AI commands for a selection, else example prompts.
-    readonly property var emptyItems: commandMode ? commandList.map(c => qsTr(c.title)) : examples
+    readonly property var emptyItems: commandMode ? commandList.map(c => win.commandTitle(c)) : examples
     readonly property string emptyHint: commandMode ? qsTr("Choose what to do with the selected text.")
                                                     : qsTr("Ask a question and the answer streams in here.")
 
@@ -39,15 +81,29 @@ Window {
             items.push({id: "stop", label: qsTr("Stop Generating"), keys: ["Esc"]})
         if (backend.messages.lastHasText)
             items.push({id: "copyAnswer", label: qsTr("Copy Answer"), keys: ["Ctrl", "Shift", "C"]})
+        if (backend.messages.hasLastCodeBlock)
+            items.push({id: "copyCode", label: qsTr("Copy Code Block"), keys: ["Ctrl", "Shift", "Y"]})
         if (hasMessages)
             items.push({id: "copyQuestion", label: qsTr("Copy Question"), keys: []})
-        if (commandMode)
-            for (const c of commandList)
-                items.push({id: "command:" + c.id, label: qsTr(c.title), keys: []})
+        if (hasMessages && !running) {
+            items.push({id: "regenerate", label: qsTr("Regenerate Answer"), keys: ["Ctrl", "R"]})
+            items.push({id: "editLast", label: qsTr("Edit Last Question"), keys: ["Ctrl", "E"]})
+        }
+        for (const c of commandList) {
+            if (commandMode || !c.requiresSelection)
+                items.push({id: "command:" + c.id, label: win.commandTitle(c), keys: []})
+        }
         if (backend.attachments.hasScreen)
             items.push({id: "screen", keys: ["Ctrl", "S"],
                         label: backend.attachments.screenEnabled ? qsTr("Remove Window Screenshot") : qsTr("Attach Window Screenshot")})
+        items.push({id: "captureRegion", label: qsTr("Capture Screen Region"), keys: ["Ctrl", "Shift", "S"]})
+        items.push({id: "attachFile", label: qsTr("Attach File…"), keys: ["Ctrl", "O"]})
+        items.push({id: "attachClipboard", label: qsTr("Attach Clipboard Text"), keys: []})
         items.push({id: "changeModel", label: qsTr("Change Model…"), keys: []})
+        items.push({id: "changeEffort", label: qsTr("Reasoning Effort…"), subtitle: backend.effort ? win.effortTitle(backend.effort) : "", keys: []})
+        if (backend.supportsFast || backend.fast)
+            items.push({id: "toggleFast", label: qsTr("Toggle Fast Mode"), checked: Boolean(backend.fast), keys: []})
+        items.push({id: "history", label: qsTr("Recent Chats…"), keys: ["Ctrl", "H"]})
         items.push({id: "newChat", label: qsTr("New Chat"), keys: ["Ctrl", "N"]})
         items.push({id: "shortcuts", label: qsTr("Keyboard Shortcuts"), keys: ["F1"]})
         return items
@@ -56,11 +112,59 @@ Window {
     readonly property var modelItems: {
         const items = [{id: "model:", label: qsTr("Default (fx)"), keys: [], checked: backend.model === ""}]
         if (backend.modelsState === Backend.ModelsLoading)
-            items.push({id: "wait", label: qsTr("Loading models…"), keys: []})
+            items.push({id: "wait", label: qsTr("Loading models…"), keys: [], disabled: true})
         else if (backend.modelsState === Backend.ModelsFailed)
             items.push({id: "retry", label: qsTr("Could not load models. Enter to retry."), keys: []})
-        for (const m of backend.models)
-            items.push({id: "model:" + m, label: m, keys: [], checked: m === backend.model})
+        const entries = backend.modelEntries || []
+        if (entries.length > 0) {
+            for (const e of entries) {
+                const name = e.name && e.name.length > 0 ? e.name : e.id
+                const sub = name !== e.id ? e.id : ""
+                items.push({
+                    id: "model:" + e.id,
+                    label: name,
+                    subtitle: sub,
+                    searchText: e.id,
+                    keys: [],
+                    checked: e.id === backend.model
+                })
+            }
+        } else {
+            for (const m of backend.models)
+                items.push({id: "model:" + m, label: m, keys: [], checked: m === backend.model})
+        }
+        return items
+    }
+
+    readonly property var effortItems: {
+        const items = [{id: "effort:", label: qsTr("Default effort"), keys: [], checked: !backend.effort}]
+        const levels = backend.availableEfforts || []
+        for (const lvl of levels)
+            items.push({id: "effort:" + lvl, label: win.effortTitle(lvl), searchText: lvl, keys: [], checked: backend.effort === lvl})
+        return items
+    }
+
+    readonly property var historyItems: {
+        const chats = backend.recentChats || []
+        if (chats.length === 0)
+            return [{id: "noop", label: qsTr("No saved chats yet"), keys: [], disabled: true}]
+        const items = []
+        for (const c of chats) {
+            const parts = []
+            if (c.modelLabel && c.modelLabel.length > 0)
+                parts.push(c.modelLabel)
+            const when = win.formatChatTime(c.updatedAt)
+            if (when.length > 0)
+                parts.push(when)
+            items.push({
+                id: "chat:" + c.id,
+                label: c.title && c.title.length > 0 ? c.title : qsTr("Untitled chat"),
+                subtitle: parts.join(" · "),
+                searchText: c.model || "",
+                checked: Boolean(c.active),
+                keys: []
+            })
+        }
         return items
     }
 
@@ -68,21 +172,54 @@ Window {
         input.forceActiveFocus()
     }
 
+    function regenerateAnswer() {
+        if (!hasMessages || running)
+            return
+        list.follow = true
+        backend.regenerate()
+    }
+
+    function editLastQuestion() {
+        if (!hasMessages || running)
+            return
+        const previous = backend.editLastQuestion()
+        if (previous.length > 0) {
+            input.text = previous
+            input.cursorPosition = input.text.length
+        }
+        input.forceActiveFocus()
+    }
+
     function runAction(id) {
-        if (id === "wait")
+        if (id === "wait" || id === "noop")
             return
         if (actionsLoader.item)
             actionsLoader.item.close()
         if (id === "stop") backend.stop()
         else if (id === "copyAnswer") backend.copyLastAnswer()
+        else if (id === "copyCode") backend.copyLastCodeBlock()
         else if (id === "copyQuestion") backend.copyLastQuestion()
+        else if (id === "regenerate") regenerateAnswer()
+        else if (id === "editLast") editLastQuestion()
         else if (id === "newChat") newChat()
         else if (id === "shortcuts") helpVisible = true
         else if (id === "screen") backend.toggleScreen()
+        else if (id === "captureRegion") backend.captureRegion()
+        else if (id === "attachFile") backend.pickFiles()
+        else if (id === "attachClipboard") backend.attachClipboardText()
         else if (id === "changeModel") openModels()
+        else if (id === "changeEffort") openEfforts()
+        else if (id === "toggleFast") backend.setFast(!backend.fast)
+        else if (id === "history") openHistory()
         else if (id === "retry") { backend.loadModels(); openModels() }
         else if (id.startsWith("model:")) backend.setModel(id.slice(6))
-        else if (id.startsWith("command:")) runCommand(id.slice(8))
+        else if (id.startsWith("effort:")) backend.setEffort(id.slice(7))
+        else if (id.startsWith("chat:")) {
+            list.follow = true
+            backend.loadChat(id.slice(5))
+            exampleIndex = -1
+            input.forceActiveFocus()
+        } else if (id.startsWith("command:")) runCommand(id.slice(8))
     }
 
     function runCommand(id) {
@@ -109,6 +246,19 @@ Window {
         actionsLoader.item.open()
     }
 
+    function openEfforts() {
+        panelMode = "efforts"
+        backend.loadModels()
+        actionsLoader.active = true
+        actionsLoader.item.open()
+    }
+
+    function openHistory() {
+        panelMode = "history"
+        actionsLoader.active = true
+        actionsLoader.item.open()
+    }
+
     function newChat() {
         backend.newChat()
         exampleIndex = -1
@@ -126,10 +276,16 @@ Window {
         }
     }
 
-    Shortcut { sequence: "Ctrl+K"; context: Qt.ApplicationShortcut; onActivated: win.actionsOpen ? actionsLoader.item.close() : win.openActions() }
+    Shortcut { sequence: "Ctrl+K"; context: Qt.ApplicationShortcut; onActivated: win.actionsOpen && win.panelMode === "actions" ? actionsLoader.item.close() : win.openActions() }
+    Shortcut { sequence: "Ctrl+H"; context: Qt.ApplicationShortcut; onActivated: win.actionsOpen && win.panelMode === "history" ? actionsLoader.item.close() : win.openHistory() }
     Shortcut { sequence: "Ctrl+S"; context: Qt.ApplicationShortcut; onActivated: backend.toggleScreen() }
+    Shortcut { sequence: "Ctrl+Shift+S"; context: Qt.ApplicationShortcut; onActivated: backend.captureRegion() }
+    Shortcut { sequence: "Ctrl+O"; context: Qt.ApplicationShortcut; onActivated: backend.pickFiles() }
     Shortcut { sequence: "Ctrl+N"; context: Qt.ApplicationShortcut; onActivated: win.newChat() }
+    Shortcut { sequence: "Ctrl+R"; context: Qt.ApplicationShortcut; onActivated: win.regenerateAnswer() }
+    Shortcut { sequence: "Ctrl+E"; context: Qt.ApplicationShortcut; onActivated: win.editLastQuestion() }
     Shortcut { sequence: "Ctrl+Shift+C"; context: Qt.ApplicationShortcut; onActivated: backend.copyLastAnswer() }
+    Shortcut { sequence: "Ctrl+Shift+Y"; context: Qt.ApplicationShortcut; onActivated: backend.copyLastCodeBlock() }
     Shortcut { sequence: "Ctrl+Q"; context: Qt.ApplicationShortcut; onActivated: Qt.quit() }
     Shortcut { sequences: ["F1", "Ctrl+/"]; context: Qt.ApplicationShortcut; onActivated: win.helpVisible = !win.helpVisible }
     Shortcut {
@@ -296,6 +452,7 @@ Window {
                             kind: model.role
                             raw: model.text
                             markdown: model.display
+                            blocks: model.blocks
                             phase: model.state
                             note: model.note
                             error: backend.errorText
@@ -328,7 +485,7 @@ Window {
                 Rectangle { width: 1; height: 16; color: Palette.divider }
                 Text {
                     id: modelLabel
-                    Layout.maximumWidth: 180
+                    Layout.maximumWidth: 160
                     text: backend.modelLabel.length ? backend.modelLabel : qsTr("Default model")
                     textFormat: Text.PlainText
                     elide: Text.ElideRight
@@ -336,6 +493,42 @@ Window {
                     font.pixelSize: 12
                     HoverHandler { id: modelHover; cursorShape: Qt.PointingHandCursor }
                     TapHandler { onTapped: win.openModels() }
+                }
+                Rectangle {
+                    visible: Boolean(backend.effort && backend.effort.length > 0)
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitWidth: effortBadgeText.implicitWidth + 10
+                    implicitHeight: 18
+                    radius: Math.min(4, theme.radius)
+                    color: effortBadgeHover.hovered ? Palette.selected : Palette.keycap
+                    Text {
+                        id: effortBadgeText
+                        anchors.centerIn: parent
+                        text: win.effortTitle(backend.effort || "")
+                        textFormat: Text.PlainText
+                        color: effortBadgeHover.hovered ? Palette.text : Palette.dim
+                        font.pixelSize: 11
+                    }
+                    HoverHandler { id: effortBadgeHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: win.openEfforts() }
+                }
+                Rectangle {
+                    visible: Boolean(backend.fast)
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitWidth: fastBadgeText.implicitWidth + 10
+                    implicitHeight: 18
+                    radius: Math.min(4, theme.radius)
+                    color: Qt.alpha(theme.accent, fastBadgeHover.hovered ? 0.24 : 0.15)
+                    Text {
+                        id: fastBadgeText
+                        anchors.centerIn: parent
+                        text: qsTr("Fast")
+                        textFormat: Text.PlainText
+                        color: theme.accent
+                        font.pixelSize: 11
+                    }
+                    HoverHandler { id: fastBadgeHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: backend.setFast(!backend.fast) }
                 }
                 StatusDot { visible: win.running; Layout.alignment: Qt.AlignVCenter }
                 Text {
@@ -370,7 +563,7 @@ Window {
         id: drop
         anchors.fill: parent
         keys: ["text/uri-list"]
-        onDropped: event => { if (event.hasUrls) backend.addImageFiles(event.urls) }
+        onDropped: event => { if (event.hasUrls) backend.addFiles(event.urls) }
     }
     Rectangle {
         anchors.fill: parent
@@ -380,7 +573,7 @@ Window {
         border.color: theme.accent
         Text {
             anchors.centerIn: parent
-            text: qsTr("Drop images to attach")
+            text: qsTr("Drop images or files to attach")
             color: theme.accent
             font.pixelSize: 15
         }
@@ -392,12 +585,45 @@ Window {
         active: false
         source: "ActionsPanel.qml"
     }
-    Binding { target: actionsLoader.item; property: "actions"; value: win.panelMode === "models" ? win.modelItems : win.actionItems; when: actionsLoader.item !== null }
-    Binding { target: actionsLoader.item; property: "placeholder"; value: win.panelMode === "models" ? qsTr("Search for models…") : qsTr("Search for actions…"); when: actionsLoader.item !== null }
-    Binding { target: actionsLoader.item; property: "popoverWidth"; value: win.panelMode === "models" ? 380 : 280; when: actionsLoader.item !== null }
+    Binding {
+        target: actionsLoader.item
+        property: "actions"
+        value: win.panelMode === "models" ? win.modelItems
+             : win.panelMode === "efforts" ? win.effortItems
+             : win.panelMode === "history" ? win.historyItems
+             : win.actionItems
+        when: actionsLoader.item !== null
+    }
+    Binding {
+        target: actionsLoader.item
+        property: "placeholder"
+        value: win.panelMode === "models" ? qsTr("Search for models…")
+             : win.panelMode === "efforts" ? qsTr("Search reasoning effort…")
+             : win.panelMode === "history" ? qsTr("Search recent chats…")
+             : qsTr("Search for actions…")
+        when: actionsLoader.item !== null
+    }
+    Binding {
+        target: actionsLoader.item
+        property: "popoverWidth"
+        value: win.panelMode === "models" || win.panelMode === "history" ? 380
+             : win.panelMode === "efforts" ? 260
+             : 310
+        when: actionsLoader.item !== null
+    }
+    Binding {
+        target: actionsLoader.item
+        property: "hasSecondaryAction"
+        value: win.panelMode === "history"
+        when: actionsLoader.item !== null
+    }
     Connections {
         target: actionsLoader.item
         function onTriggered(id) { win.runAction(id) }
+        function onSecondaryTriggered(id) {
+            if (id.startsWith("chat:"))
+                backend.deleteChat(id.slice(5))
+        }
         function onDismissed() { input.forceActiveFocus() }
     }
 
@@ -410,14 +636,20 @@ Window {
                 {label: qsTr("New line"), keys: ["Shift", "↵"]},
                 {label: qsTr("Stop, then hide"), keys: ["Esc"]},
                 {label: qsTr("Actions"), keys: ["Ctrl", "K"]},
+                {label: qsTr("Recent Chats…"), keys: ["Ctrl", "H"]},
                 {label: qsTr("New Chat"), keys: ["Ctrl", "N"]},
+                {label: qsTr("Regenerate Answer"), keys: ["Ctrl", "R"]},
+                {label: qsTr("Edit Last Question"), keys: ["Ctrl", "E"]},
                 {label: qsTr("Copy Answer"), keys: ["Ctrl", "Shift", "C"]},
+                {label: qsTr("Copy Code Block"), keys: ["Ctrl", "Shift", "Y"]},
                 {label: qsTr("Attach window screenshot"), keys: ["Ctrl", "S"]},
+                {label: qsTr("Capture Screen Region"), keys: ["Ctrl", "Shift", "S"]},
+                {label: qsTr("Attach File…"), keys: ["Ctrl", "O"]},
                 {label: qsTr("Paste image"), keys: ["Ctrl", "V"]},
                 {label: qsTr("Remove last attachment"), keys: ["⌫"]},
                 {label: qsTr("Recall last question"), keys: ["↑"]},
-                {label: qsTr("Quit"), keys: ["Ctrl", "Q"]},
-                {label: qsTr("Keyboard Shortcuts"), keys: ["F1"]}
+                {label: qsTr("Keyboard Shortcuts"), keys: ["F1"]},
+                {label: qsTr("Quit"), keys: ["Ctrl", "Q"]}
             ]
             onDismissed: win.helpVisible = false
         }

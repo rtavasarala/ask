@@ -47,6 +47,8 @@ public:
     void setPayload(int row, const QString &path);
     // Removes and returns the chips that a request just consumed.
     QList<Attachment> takeEnabled();
+    // Puts unconsumed chips from a failed request back at the front so a retry keeps them.
+    void restore(const QList<Attachment> &attachments);
     QList<Attachment> clear();
 
 signals:

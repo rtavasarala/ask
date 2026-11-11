@@ -10,28 +10,21 @@
 #include <QImageReader>
 #include <QMimeData>
 #include <QProcessEnvironment>
-#include <QRandomGenerator>
-#include <QStandardPaths>
-#include <QTimer>
-#include <memory>
+#include <QSet>
+#include <QWindow>
 #include <unistd.h>
+#include <utility>
 
 #include "commands.h"
+#include "history.h"
+#include "portalfilepicker.h"
 #include "prompt.h"
-#include "settings.h"
 
 namespace {
-const char *const kSystemPrompt =
-    "You are Ask, a quick assistant in a desktop popup. Answer directly and concisely in Markdown. "
-    "There is no project or file context; don't run tools or commands unless the user asks.";
-
-// The launcher may not have ~/.local/bin on PATH, where fx installs itself.
-QString resolveFx() {
-    const QString found = QStandardPaths::findExecutable("fx");
-    if (!found.isEmpty())
-        return found;
-    const QString fallback = QDir::homePath() + "/.local/bin/fx";
-    return QFileInfo(fallback).isExecutable() ? fallback : QString();
+bool isEnglishCode(const QString &language) {
+    const QString clean = language.trimmed().toLower();
+    return clean.isEmpty() || clean == QLatin1String("en")
+           || clean.startsWith(QLatin1String("en-")) || clean.startsWith(QLatin1String("en_"));
 }
 }
 
@@ -40,24 +33,47 @@ Backend::Backend(const QString &fxPath, const QString &stateDir, const Paths &pa
       m_fxPath(fxPath),
       m_stateDir(stateDir.isEmpty() ? QDir::homePath() + "/.local/state/ask" : stateDir),
       m_grim(paths.grim.isEmpty() ? QStringLiteral("grim") : paths.grim),
+      m_slurp(paths.slurp.isEmpty() ? QStringLiteral("slurp") : paths.slurp),
       m_runtimeDir(paths.runtimeDir),
-      m_settingsFile(paths.settingsFile) {
+      m_settingsFile(paths.settingsFile),
+      m_paths(paths) {
     if (m_runtimeDir.isEmpty()) {
         const QString base = qEnvironmentVariable("XDG_RUNTIME_DIR", QString("/tmp/ask-%1").arg(getuid()));
         m_runtimeDir = base + "/ask";
     }
-    if (!m_settingsFile.isEmpty())
-        m_model = Settings::load(m_settingsFile).model;
+    if (!m_settingsFile.isEmpty()) {
+        const Settings loaded = Settings::load(m_settingsFile);
+        m_model = loaded.model;
+        m_effort = loaded.effort;
+        m_fast = loaded.fast;
+    }
+    m_flushTimer.setSingleShot(true);
+    m_flushTimer.setInterval(16);
+    connect(&m_flushTimer, &QTimer::timeout, this, &Backend::flushPendingOutput);
 }
 
 Backend::~Backend() {
+    m_flushTimer.stop();
     for (auto *process : findChildren<QProcess *>()) {
         process->disconnect(this);
         process->kill();
         process->waitForFinished(1000);
     }
     release(m_attachments.clear());
-    releaseInFlight();
+    release(std::exchange(m_inFlightAttachments, {}));
+}
+
+void Backend::setFilePicker(std::unique_ptr<FilePicker> picker) {
+    m_filePicker = std::move(picker);
+}
+
+void Backend::setUiLanguage(const QString &lang) {
+    m_uiLanguage = lang.trimmed();
+}
+
+void Backend::saveSettings() const {
+    if (!m_settingsFile.isEmpty())
+        Settings{m_model, m_effort, m_fast}.save(m_settingsFile);
 }
 
 bool Backend::ensureRuntimeDir() {
@@ -79,9 +95,27 @@ void Backend::release(const QList<Attachment> &attachments) {
             QFile::remove(a.payload);
 }
 
-void Backend::releaseInFlight() {
-    for (const QString &path : std::exchange(m_inFlightFiles, {}))
-        QFile::remove(path);
+void Backend::restoreInFlight() {
+    const QList<Attachment> inFlight = std::exchange(m_inFlightAttachments, {});
+    if (inFlight.isEmpty())
+        return;
+    bool hasSelection = false;
+    for (const Attachment &existing : m_attachments.items()) {
+        if (existing.kind == Attachment::Selection)
+            hasSelection = true;
+    }
+    const bool hasScreen = m_attachments.hasScreen();
+    QList<Attachment> keep, drop;
+    for (const Attachment &a : inFlight) {
+        if ((a.kind == Attachment::Selection && hasSelection)
+            || (a.kind == Attachment::Screen && hasScreen)) {
+            drop << a;
+        } else {
+            keep << a;
+        }
+    }
+    release(drop);
+    m_attachments.restore(keep);
 }
 
 void Backend::setStatus(Status status, const QString &error) {
@@ -102,7 +136,17 @@ bool Backend::ensureWorkspace() {
     if (!QDir().mkpath(path))
         return false;
     m_workspace = path;
+    if (!m_prunedOnStartup) {
+        m_prunedOnStartup = true;
+        History::prune(m_stateDir, m_workspace);
+    }
     return true;
+}
+
+void Backend::flushPendingOutput() {
+    m_flushTimer.stop();
+    if (!m_pendingOutput.isEmpty())
+        m_messages.appendToLast(std::exchange(m_pendingOutput, {}));
 }
 
 bool Backend::send(const QString &prompt) {
@@ -125,7 +169,7 @@ bool Backend::send(const QString &prompt) {
     m_messages.append("assistant", {}, "streaming");
 
     // Resolved at send time so installing fx while Ask is resident works.
-    const QString fx = m_fxPath.isEmpty() ? resolveFx() : m_fxPath;
+    const QString fx = m_fxPath.isEmpty() ? resolveFxExecutable() : m_fxPath;
     if (fx.isEmpty()) {
         m_messages.setLastState("failed");
         setStatus(Failed, tr("fx is not installed or not on PATH. Install it from https://fx.sh and try again."));
@@ -137,22 +181,35 @@ bool Backend::send(const QString &prompt) {
         return true;
     }
 
-    // The chips this question consumed. Their files live until the request ends.
+    // The chips this question consumed. If the request fails, they return to the model.
     const QList<Attachment> taken = m_attachments.takeEnabled();
     const AssembledPrompt assembled = assemblePrompt(text, taken);
-    for (const Attachment &a : taken)
-        if (a.owned && !a.payload.isEmpty())
-            m_inFlightFiles << a.payload;
+    release(std::exchange(m_inFlightAttachments, taken));
 
-    QStringList args{"ask", "--no-color", "--system", kSystemPrompt};
+    const ModelInfo *matchedModel = nullptr;
+    bool richMetadata = false;
+    for (const ModelInfo &info : m_modelInfos) {
+        if (!info.name.isEmpty() || !info.efforts.isEmpty() || info.fast || info.ultrafast)
+            richMetadata = true;
+        if (!m_model.isEmpty() && info.id == m_model)
+            matchedModel = &info;
+    }
+
+    QStringList args{"ask", "--no-color", "--system", askSystemPrompt()};
     if (!m_model.isEmpty())
         args << "--model" << m_model;
+    if (!m_effort.isEmpty() && (!richMetadata || !matchedModel || matchedModel->efforts.contains(m_effort)))
+        args << "--effort" << m_effort;
+    if (m_fast && (!richMetadata || !matchedModel || matchedModel->fast || matchedModel->ultrafast))
+        args << "--fast";
     if (m_canResume)
         args << "--resume" << "last";
     for (const QString &image : assembled.images)
         args << "--image" << image;
     args << "--" << assembled.text;
 
+    m_pendingOutput.clear();
+    m_flushTimer.stop();
     auto *process = new QProcess(this);
     m_process = process;
     m_decoder = QStringDecoder(QStringConverter::Utf8);
@@ -164,17 +221,21 @@ bool Backend::send(const QString &prompt) {
     auto errors = std::make_shared<QByteArray>();
     connect(process, &QProcess::readyReadStandardOutput, this, [this, process] {
         const QByteArray bytes = process->readAllStandardOutput();
-        if (process == m_process)
-            m_messages.appendToLast(m_decoder(bytes));
+        if (process != m_process || bytes.isEmpty())
+            return;
+        m_pendingOutput += m_decoder(bytes);
+        if (!m_flushTimer.isActive())
+            m_flushTimer.start();
     });
     connect(process, &QProcess::readyReadStandardError, this, [process, errors] { *errors += process->readAllStandardError(); });
     connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart || process != m_process)
             return;
+        flushPendingOutput();
         m_process.clear();
         m_messages.setLastState("failed");
         setStatus(Failed, tr("fx is not installed or not on PATH. Install it from https://fx.sh and try again."));
-        releaseInFlight();
+        restoreInFlight();
         process->deleteLater();
     });
     connect(process, &QProcess::finished, this, [this, process, errors](int code, QProcess::ExitStatus exit) {
@@ -191,18 +252,24 @@ void Backend::finished(QProcess *process, int code, QProcess::ExitStatus exit, c
     if (process != m_process)
         return;
     m_process.clear();
-    releaseInFlight();
     const QByteArray rest = process->readAllStandardOutput();
     if (!rest.isEmpty())
-        m_messages.appendToLast(m_decoder(rest));
+        m_pendingOutput += m_decoder(rest);
+    flushPendingOutput();
+
     if (exit == QProcess::NormalExit && code == 0) {
+        release(std::exchange(m_inFlightAttachments, {}));
         m_messages.setLastState("done");
         if (!m_canResume) {
             m_canResume = true;
             emit canResumeChanged();
         }
+        History::recordChat(m_stateDir, m_workspace, m_model, m_messages.turns());
+        m_prunedOnStartup = true;
+        emit historyChanged();
         setStatus(Idle);
     } else {
+        restoreInFlight();
         m_messages.setLastState("failed");
         setStatus(Failed, failureText(code, errors));
     }
@@ -226,6 +293,11 @@ void Backend::stop() {
         return;
     QProcess *process = m_process;
     m_process.clear();
+    const QByteArray buffered = process->readAllStandardOutput();
+    if (!buffered.isEmpty())
+        m_pendingOutput += m_decoder(buffered);
+    flushPendingOutput();
+
     // The process is detached from our state now; it only has to die.
     process->terminate();
     QTimer::singleShot(2000, process, [process] {
@@ -233,7 +305,7 @@ void Backend::stop() {
             process->kill();
     });
     connect(process, &QProcess::finished, process, &QObject::deleteLater);
-    releaseInFlight();
+    release(std::exchange(m_inFlightAttachments, {}));
     m_messages.setLastState("stopped");
     setStatus(Stopped);
 }
@@ -241,6 +313,9 @@ void Backend::stop() {
 void Backend::newChat() {
     if (m_status == Running)
         stop();
+    m_pendingOutput.clear();
+    m_flushTimer.stop();
+    release(std::exchange(m_inFlightAttachments, {}));
     m_messages.clear();
     m_workspace.clear();
     release(m_attachments.clear());
@@ -249,34 +324,141 @@ void Backend::newChat() {
         emit canResumeChanged();
     }
     setStatus(Idle);
+    emit historyChanged();
 }
 
 QString Backend::lastQuestion() const { return m_messages.lastText("user"); }
 
-void Backend::copyLastAnswer() {
-    const QString text = m_messages.lastText("assistant");
+void Backend::copyText(const QString &text) {
     if (!text.isEmpty())
         QGuiApplication::clipboard()->setText(text);
+}
+
+void Backend::copyLastAnswer() {
+    copyText(m_messages.lastText("assistant"));
 }
 
 void Backend::copyLastQuestion() {
-    const QString text = lastQuestion();
-    if (!text.isEmpty())
-        QGuiApplication::clipboard()->setText(text);
+    copyText(lastQuestion());
+}
+
+bool Backend::copyLastCodeBlock() {
+    const QString code = m_messages.lastCodeBlock();
+    if (code.isEmpty())
+        return false;
+    QGuiApplication::clipboard()->setText(code);
+    return true;
+}
+
+bool Backend::hasLastCodeBlock() const {
+    return m_messages.hasLastCodeBlock();
+}
+
+bool Backend::regenerate() {
+    if (m_status == Running || m_messages.count() < 2 || lastQuestion().trimmed().isEmpty())
+        return false;
+    for (const Attachment &a : m_attachments.items())
+        if (a.enabled && a.state == Attachment::Capturing)
+            return false;
+    const QString q = m_messages.removeLastTurn();
+    if (m_messages.count() == 0 && m_canResume) {
+        m_canResume = false;
+        emit canResumeChanged();
+    }
+    return send(q);
+}
+
+QString Backend::editLastQuestion() {
+    if (m_status == Running)
+        stop();
+    if (m_messages.count() == 0)
+        return {};
+    const QString q = m_messages.removeLastTurn();
+    if (m_messages.count() == 0 && m_canResume) {
+        m_canResume = false;
+        emit canResumeChanged();
+    }
+    setStatus(Idle);
+    return q;
 }
 
 bool Backend::runCommand(const QString &id) {
-    const AiCommand *command = findAiCommand(id);
-    if (!command || (command->requiresSelection && !m_attachments.hasEnabledSelection()))
-        return false;
-    return send(command->promptTemplate);
+    if (id == QLatin1String("translateToLocal")) {
+        if (!m_attachments.hasEnabledSelection())
+            return false;
+        const QString lang = !m_uiLanguage.isEmpty() ? m_uiLanguage : m_lastQueriedLanguage;
+        if (isEnglishCode(lang))
+            return false;
+        const QString target = translateTargetLanguageName(lang);
+        if (target.isEmpty())
+            return false;
+        return send(QString("Translate the selected text to %1. Reply with only the translation.").arg(target));
+    }
+    if (const AiCommand *command = findAiCommand(id)) {
+        if (command->requiresSelection && !m_attachments.hasEnabledSelection())
+            return false;
+        return send(command->promptTemplate);
+    }
+    if (!m_paths.commandsFile.isEmpty()) {
+        for (const AiCommand &custom : loadCustomCommands(m_paths.commandsFile)) {
+            if (custom.id != id)
+                continue;
+            if (custom.requiresSelection && !m_attachments.hasEnabledSelection())
+                return false;
+            return send(custom.promptTemplate);
+        }
+    }
+    return false;
 }
 
 QVariantList Backend::commands() const {
+    return commandsForLanguage({});
+}
+
+QVariantList Backend::commandsForLanguage(const QString &language) const {
+    if (!language.isEmpty())
+        m_lastQueriedLanguage = language.trimmed();
+
     QVariantList list;
-    for (const AiCommand &command : aiCommands())
-        list << QVariantMap{{"id", command.id}, {"title", QString::fromUtf8(command.title)},
-                            {"requiresSelection", command.requiresSelection}};
+    QSet<QString> seen;
+    const QString targetLang = isEnglishCode(language) ? QString() : translateTargetLanguageName(language);
+
+    for (const AiCommand &command : aiCommands()) {
+        seen.insert(command.id);
+        list << QVariantMap{
+            {"id", command.id},
+            {"title", command.title ? QString::fromUtf8(command.title) : command.customTitle},
+            {"requiresSelection", command.requiresSelection},
+            {"isCustom", false},
+            {"custom", false},
+        };
+        if (command.id == QLatin1String("translate") && !targetLang.isEmpty() && targetLang != QLatin1String("English")) {
+            seen.insert(QStringLiteral("translateToLocal"));
+            list << QVariantMap{
+                {"id", QStringLiteral("translateToLocal")},
+                {"title", QStringLiteral("Translate to %1").arg(targetLang)},
+                {"targetLanguage", targetLang},
+                {"requiresSelection", true},
+                {"isCustom", false},
+                {"custom", false},
+            };
+        }
+    }
+
+    if (!m_paths.commandsFile.isEmpty()) {
+        for (const AiCommand &custom : loadCustomCommands(m_paths.commandsFile)) {
+            if (custom.id.isEmpty() || seen.contains(custom.id))
+                continue;
+            seen.insert(custom.id);
+            list << QVariantMap{
+                {"id", custom.id},
+                {"title", custom.title ? QString::fromUtf8(custom.title) : custom.customTitle},
+                {"requiresSelection", custom.requiresSelection},
+                {"isCustom", true},
+                {"custom", true},
+            };
+        }
+    }
     return list;
 }
 
@@ -315,7 +497,10 @@ void Backend::startCapture(int row) {
 
     auto *process = new QProcess(this);
     auto errors = std::make_shared<QByteArray>();
-    auto fail = [this, id, target, process](const QString &why) {
+    auto settled = std::make_shared<bool>(false);
+    auto fail = [this, id, target, process, settled](const QString &why) {
+        if (std::exchange(*settled, true))
+            return;
         QFile::remove(target);
         const int at = m_attachments.rowOfId(id);
         if (at >= 0) {
@@ -324,17 +509,31 @@ void Backend::startCapture(int row) {
         }
         process->deleteLater();
     };
+
+    if (m_paths.captureTimeoutMs > 0) {
+        QTimer::singleShot(m_paths.captureTimeoutMs, process, [this, process, fail] {
+            if (process->state() == QProcess::NotRunning)
+                return;
+            process->disconnect(this);
+            process->kill();
+            fail(tr("Window capture timed out."));
+        });
+    }
+
     connect(process, &QProcess::readyReadStandardError, this, [process, errors] { *errors += process->readAllStandardError(); });
     connect(process, &QProcess::errorOccurred, this, [fail, this](QProcess::ProcessError error) {
         if (error == QProcess::FailedToStart)
             fail(tr("grim is not installed or not on PATH."));
     });
-    connect(process, &QProcess::finished, this, [this, id, target, process, errors, fail](int code, QProcess::ExitStatus exit) {
+    connect(process, &QProcess::finished, this, [this, id, target, process, errors, settled, fail](int code, QProcess::ExitStatus exit) {
+        if (*settled)
+            return;
         if (exit != QProcess::NormalExit || code != 0 || !QFileInfo(target).size()) {
             const QString detail = QString::fromUtf8(*errors).trimmed();
             fail(detail.isEmpty() ? tr("grim exited with code %1").arg(code) : detail.left(300));
             return;
         }
+        *settled = true;
         QFile::setPermissions(target, QFile::ReadOwner | QFile::WriteOwner);
         const int at = m_attachments.rowOfId(id);
         if (at < 0) {
@@ -347,6 +546,118 @@ void Backend::startCapture(int row) {
         process->deleteLater();
     });
     process->start(m_grim, {"-T", chip->stableId, "-t", "jpeg", "-q", "80", target}, QIODevice::ReadOnly);
+}
+
+void Backend::captureRegion() {
+    if (m_capturingRegion)
+        return;
+    m_capturingRegion = true;
+
+    bool hadVisibleWindow = false;
+    for (QWindow *w : QGuiApplication::topLevelWindows()) {
+        if (w && w->isVisible()) {
+            hadVisibleWindow = true;
+            break;
+        }
+    }
+    const QString platform = QGuiApplication::platformName();
+    const bool headless = platform == QLatin1String("offscreen") || platform == QLatin1String("minimal");
+
+    emit hideWindowRequested();
+    if (hadVisibleWindow && !headless) {
+        QTimer::singleShot(120, this, &Backend::startRegionCapture);
+    } else {
+        startRegionCapture();
+    }
+}
+
+void Backend::startRegionCapture() {
+    auto *slurpProc = new QProcess(this);
+    auto slurpSettled = std::make_shared<bool>(false);
+
+    connect(slurpProc, &QProcess::errorOccurred, this, [this, slurpProc, slurpSettled](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart || std::exchange(*slurpSettled, true))
+            return;
+        m_capturingRegion = false;
+        setStatus(Failed, tr("slurp is not installed or not on PATH."));
+        emit showWindowRequested();
+        slurpProc->deleteLater();
+    });
+
+    connect(slurpProc, &QProcess::finished, this, [this, slurpProc, slurpSettled](int code, QProcess::ExitStatus exit) {
+        if (std::exchange(*slurpSettled, true))
+            return;
+        const QString geom = QString::fromUtf8(slurpProc->readAllStandardOutput()).trimmed();
+        slurpProc->deleteLater();
+
+        if (exit != QProcess::NormalExit || code != 0 || geom.isEmpty()) {
+            m_capturingRegion = false;
+            emit showWindowRequested();
+            return;
+        }
+
+        const QString target = newRuntimeFile("region", "jpg");
+        if (target.isEmpty()) {
+            m_capturingRegion = false;
+            setStatus(Failed, tr("Could not create %1.").arg(m_runtimeDir));
+            emit showWindowRequested();
+            return;
+        }
+
+        auto *grimProc = new QProcess(this);
+        auto errors = std::make_shared<QByteArray>();
+        auto grimSettled = std::make_shared<bool>(false);
+        auto failGrim = [this, target, grimProc, grimSettled](const QString &why) {
+            if (std::exchange(*grimSettled, true))
+                return;
+            QFile::remove(target);
+            m_capturingRegion = false;
+            setStatus(Failed, why);
+            emit showWindowRequested();
+            grimProc->deleteLater();
+        };
+
+        if (m_paths.captureTimeoutMs > 0) {
+            QTimer::singleShot(m_paths.captureTimeoutMs, grimProc, [this, grimProc, failGrim] {
+                if (grimProc->state() == QProcess::NotRunning)
+                    return;
+                grimProc->disconnect(this);
+                grimProc->kill();
+                failGrim(tr("Window capture timed out."));
+            });
+        }
+
+        connect(grimProc, &QProcess::readyReadStandardError, this,
+                [grimProc, errors] { *errors += grimProc->readAllStandardError(); });
+        connect(grimProc, &QProcess::errorOccurred, this, [this, failGrim](QProcess::ProcessError error) {
+            if (error == QProcess::FailedToStart)
+                failGrim(tr("grim is not installed or not on PATH."));
+        });
+        connect(grimProc, &QProcess::finished, this,
+                [this, target, grimProc, errors, grimSettled, failGrim](int gCode, QProcess::ExitStatus gExit) {
+            if (*grimSettled)
+                return;
+            if (gExit != QProcess::NormalExit || gCode != 0 || !QFileInfo(target).size()) {
+                const QString detail = QString::fromUtf8(*errors).trimmed();
+                failGrim(detail.isEmpty() ? tr("grim exited with code %1").arg(gCode) : detail.left(300));
+                return;
+            }
+            *grimSettled = true;
+            QFile::setPermissions(target, QFile::ReadOwner | QFile::WriteOwner);
+            Attachment a;
+            a.kind = Attachment::Image;
+            a.label = tr("Region screenshot");
+            a.payload = target;
+            a.owned = true;
+            m_attachments.add(a);
+            m_capturingRegion = false;
+            emit showWindowRequested();
+            grimProc->deleteLater();
+        });
+        grimProc->start(m_grim, {"-g", geom, "-t", "jpeg", "-q", "85", target}, QIODevice::ReadOnly);
+    });
+
+    slurpProc->start(m_slurp, {}, QIODevice::ReadOnly);
 }
 
 void Backend::removeAttachment(int row) {
@@ -381,6 +692,25 @@ bool Backend::pasteImage() {
     return true;
 }
 
+bool Backend::attachClipboardText() {
+    const QString raw = QGuiApplication::clipboard()->text();
+    if (raw.trimmed().isEmpty())
+        return false;
+    const QString bounded = raw.left(Context::kMaxSelection);
+    for (int i = m_attachments.rowCount() - 1; i >= 0; --i) {
+        if (m_attachments.at(i)->kind == Attachment::Selection)
+            release({*m_attachments.removeAt(i)});
+    }
+    Attachment a;
+    a.kind = Attachment::Selection;
+    a.label = oneLinePreview(bounded);
+    a.tooltip = oneLinePreview(bounded, 400);
+    a.payload = bounded;
+    a.enabled = true;
+    m_attachments.restore({a});
+    return true;
+}
+
 int Backend::addImageFiles(const QList<QUrl> &urls) {
     int added = 0;
     for (const QUrl &url : urls) {
@@ -398,36 +728,201 @@ int Backend::addImageFiles(const QList<QUrl> &urls) {
     return added;
 }
 
+int Backend::addFiles(const QList<QUrl> &urls) {
+    int added = 0;
+    for (const QUrl &url : urls) {
+        const QString path = url.isLocalFile() ? url.toLocalFile() : QString();
+        if (const auto att = attachmentFromLocalFile(path)) {
+            m_attachments.add(*att);
+            ++added;
+        }
+    }
+    return added;
+}
+
+void Backend::pickFiles() {
+    if (!m_filePicker)
+        m_filePicker = std::make_unique<PortalFilePicker>(this);
+    QPointer<Backend> self(this);
+    m_filePicker->openFiles(QGuiApplication::focusWindow(), [self](const QList<QUrl> &urls) {
+        if (self && !urls.isEmpty())
+            self->addFiles(urls);
+    });
+}
+
+QVariantList Backend::modelEntries() const {
+    QVariantList list;
+    list.reserve(m_modelInfos.size());
+    for (const ModelInfo &info : m_modelInfos) {
+        list << QVariantMap{
+            {"id", info.id},
+            {"name", info.name},
+            {"efforts", info.efforts},
+            {"fast", info.fast},
+            {"ultrafast", info.ultrafast},
+        };
+    }
+    return list;
+}
+
+QStringList Backend::availableEfforts() const {
+    bool richMetadata = false;
+    for (const ModelInfo &info : m_modelInfos) {
+        if (!info.name.isEmpty() || !info.efforts.isEmpty() || info.fast || info.ultrafast) {
+            richMetadata = true;
+            break;
+        }
+    }
+    if (!m_model.isEmpty()) {
+        for (const ModelInfo &info : m_modelInfos) {
+            if (info.id == m_model)
+                return richMetadata ? info.efforts : QStringList{QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high")};
+        }
+    }
+    return {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high")};
+}
+
+bool Backend::supportsFast() const {
+    for (const ModelInfo &info : m_modelInfos) {
+        if (info.id == m_model)
+            return info.fast || info.ultrafast;
+    }
+    return false;
+}
+
 void Backend::loadModels() {
     if (m_modelsState == ModelsLoading || m_modelsState == ModelsReady)
         return;
-    const QString fx = m_fxPath.isEmpty() ? resolveFx() : m_fxPath;
+    const QString fx = m_fxPath.isEmpty() ? resolveFxExecutable() : m_fxPath;
     m_modelsState = ModelsLoading;
     emit modelsChanged();
+
     auto *process = new QProcess(this);
-    connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
-        if (error != QProcess::FailedToStart)
+    auto settled = std::make_shared<bool>(false);
+    auto failModels = [this, process, settled] {
+        if (std::exchange(*settled, true))
             return;
+        m_modelInfos.clear();
+        m_models.clear();
         m_modelsState = ModelsFailed;
         emit modelsChanged();
+        emit effortChanged();
         process->deleteLater();
+    };
+
+    if (m_paths.modelsTimeoutMs > 0) {
+        QTimer::singleShot(m_paths.modelsTimeoutMs, process, [this, process, failModels] {
+            if (process->state() == QProcess::NotRunning)
+                return;
+            process->disconnect(this);
+            process->kill();
+            failModels();
+        });
+    }
+
+    connect(process, &QProcess::errorOccurred, this, [failModels](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart)
+            failModels();
     });
-    connect(process, &QProcess::finished, this, [this, process](int code, QProcess::ExitStatus exit) {
-        const QStringList parsed = parseModels(process->readAllStandardOutput());
-        const bool ok = exit == QProcess::NormalExit && code == 0 && !parsed.isEmpty();
-        m_models = ok ? parsed : QStringList();
-        m_modelsState = ok ? ModelsReady : ModelsFailed;
+    connect(process, &QProcess::finished, this, [this, process, settled, failModels](int code, QProcess::ExitStatus exit) {
+        if (*settled)
+            return;
+        const QList<ModelInfo> parsed = parseModelInfos(process->readAllStandardOutput());
+        if (exit != QProcess::NormalExit || code != 0 || parsed.isEmpty()) {
+            failModels();
+            return;
+        }
+        *settled = true;
+        m_modelInfos = parsed;
+        m_models.clear();
+        m_models.reserve(parsed.size());
+        for (const ModelInfo &info : parsed)
+            m_models << info.id;
+        m_modelsState = ModelsReady;
         emit modelsChanged();
+        emit effortChanged();
         process->deleteLater();
     });
-    process->start(fx.isEmpty() ? QStringLiteral("fx") : fx, {"models"}, QIODevice::ReadOnly);
+    process->start(fx.isEmpty() ? QStringLiteral("fx") : fx, {"models", "--json"}, QIODevice::ReadOnly);
 }
 
 void Backend::setModel(const QString &id) {
     if (id == m_model)
         return;
     m_model = id;
-    if (!m_settingsFile.isEmpty())
-        Settings{m_model}.save(m_settingsFile);
+    saveSettings();
     emit modelChanged();
+    emit modelsChanged();
+    emit effortChanged();
+}
+
+void Backend::setEffort(const QString &effort) {
+    const QString trimmed = effort.trimmed();
+    if (trimmed == m_effort)
+        return;
+    m_effort = trimmed;
+    saveSettings();
+    emit effortChanged();
+}
+
+void Backend::setFast(bool fast) {
+    if (fast == m_fast)
+        return;
+    m_fast = fast;
+    saveSettings();
+    emit fastChanged();
+}
+
+QVariantList Backend::recentChats() const {
+    if (!m_prunedOnStartup) {
+        m_prunedOnStartup = true;
+        History::prune(m_stateDir, m_workspace);
+    }
+    const QString cleanActive = m_workspace.isEmpty() ? QString() : QDir::cleanPath(m_workspace);
+    QVariantList list;
+    for (const SavedChat &chat : History::load(m_stateDir)) {
+        list << QVariantMap{
+            {"id", chat.id},
+            {"title", chat.title},
+            {"model", chat.model},
+            {"modelLabel", chat.model.isEmpty() ? QString() : shortModelName(chat.model)},
+            {"updatedAt", chat.updatedAt},
+            {"active", !cleanActive.isEmpty() && QDir::cleanPath(chat.workspace) == cleanActive},
+            {"turnCount", int(chat.turns.size())},
+        };
+    }
+    return list;
+}
+
+bool Backend::loadChat(const QString &id) {
+    const auto saved = History::find(m_stateDir, id);
+    if (!saved || !QFileInfo(saved->workspace).isDir())
+        return false;
+    if (m_status == Running)
+        stop();
+    m_pendingOutput.clear();
+    m_flushTimer.stop();
+    release(std::exchange(m_inFlightAttachments, {}));
+    release(m_attachments.clear());
+    m_workspace = saved->workspace;
+    m_messages.setTurns(saved->turns);
+    const bool resumable = !saved->turns.isEmpty();
+    if (m_canResume != resumable) {
+        m_canResume = resumable;
+        emit canResumeChanged();
+    }
+    setStatus(Idle);
+    emit historyChanged();
+    return true;
+}
+
+bool Backend::deleteChat(const QString &id) {
+    const auto saved = History::find(m_stateDir, id);
+    if (!saved)
+        return false;
+    if (!m_workspace.isEmpty() && QDir::cleanPath(saved->workspace) == QDir::cleanPath(m_workspace))
+        newChat();
+    const bool ok = History::remove(m_stateDir, id);
+    emit historyChanged();
+    return ok;
 }

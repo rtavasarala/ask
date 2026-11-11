@@ -3,6 +3,10 @@
 #include <QLocalSocket>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickStyle>
+#include <QQuickWindow>
 #include <QRegularExpression>
 #include <QFile>
 #include <QSignalSpy>
@@ -13,9 +17,13 @@
 #include <unistd.h>
 
 #include "backend.h"
+#include "cli.h"
 #include "commands.h"
 #include "context.h"
+#include "filepicker.h"
+#include "history.h"
 #include "instance.h"
+#include "markdown.h"
 #include "prompt.h"
 #include "settings.h"
 #include "theme.h"
@@ -730,7 +738,7 @@ private slots:
         backend.loadModels();
         QTest::qWait(100);
         QCOMPARE(rig.calls().size(), 1);
-        QVERIFY(rig.calls().first().endsWith("|models"));
+        QVERIFY(rig.calls().first().endsWith("|models|--json"));
     }
 
     void modelsFailureIsReportedAndRetryable() {
@@ -840,6 +848,476 @@ private slots:
         QCOMPARE(translator.translate("Main", "%n clips", nullptr, 25), QString("%n клипов"));
         QCOMPARE(Translator::pluralCategory("ar", 11), QString("many"));
         QCOMPARE(Translator::pluralCategory("ja", 1), QString("other"));
+    }
+
+    void warmServerGathererAndRapidToggleRace() {
+        const QString name = QString("ask-test-warm-%1").arg(getpid());
+        Instance running(name);
+        running.setVisibleProbe([] { return false; });
+        running.setContextGatherer([] { return Context{"Alacritty", "zsh", "abc0", "server text"}; });
+        QVERIFY(running.listen());
+        QSignalSpy shown(&running, &Instance::showRequested);
+        std::atomic<int> clientGatherCalls{0};
+        auto outcome = std::async(std::launch::async, [name, &clientGatherCalls] {
+            Instance client(name);
+            return client.toggleRunning([&clientGatherCalls] {
+                ++clientGatherCalls;
+                return Context{};
+            });
+        });
+        QTRY_COMPARE(shown.count(), 1);
+        QCOMPARE(outcome.get(), Instance::Showed);
+        QCOMPARE(clientGatherCalls.load(), 0);
+        QCOMPARE(shown.first().first().value<std::optional<Context>>()->selection, QString("server text"));
+
+        // Rapid double-press when awaiting client context must cancel the pending show.
+        const QString raceName = QString("ask-test-race-%1").arg(getpid());
+        Instance raceServer(raceName);
+        raceServer.setVisibleProbe([] { return false; });
+        QVERIFY(raceServer.listen());
+        QSignalSpy raceShown(&raceServer, &Instance::showRequested);
+        QSignalSpy raceHidden(&raceServer, &Instance::hideRequested);
+
+        QLocalSocket first;
+        first.connectToServer(raceName);
+        QTRY_COMPARE(first.state(), QLocalSocket::ConnectedState);
+        first.write("{\"cmd\":\"toggle\"}\n");
+        first.flush();
+        QTRY_VERIFY(first.bytesAvailable() > 0);
+        QVERIFY(first.readAll().contains("need-context"));
+
+        QLocalSocket second;
+        second.connectToServer(raceName);
+        QTRY_COMPARE(second.state(), QLocalSocket::ConnectedState);
+        second.write("{\"cmd\":\"toggle\"}\n");
+        second.flush();
+        QTRY_COMPARE(raceHidden.count(), 1);
+        QCOMPARE(raceShown.count(), 0);
+
+        // Late context from the first socket is ignored.
+        first.write("{\"cmd\":\"context\",\"context\":{\"selection\":\"late\"}}\n");
+        first.flush();
+        QTest::qWait(100);
+        QCOMPARE(raceShown.count(), 0);
+    }
+
+    void instanceForwardsOpenRequestFields() {
+        const QString name = QString("ask-test-open-%1").arg(getpid());
+        Instance running(name);
+        running.setVisibleProbe([] { return false; });
+        running.setContextGatherer([] { return Context{"firefox", "Doc", "1a2b", "picked"}; });
+        QVERIFY(running.listen());
+        QSignalSpy received(&running, &Instance::requestReceived);
+
+        Instance::Request sent;
+        sent.prompt = "Explain";
+        sent.commandId = "summarize";
+        sent.newChat = true;
+        sent.files = {"/tmp/a.txt"};
+        sent.model = "vendor/alpha-1";
+        sent.effort = "high";
+        sent.fast = true;
+
+        auto outcome = std::async(std::launch::async, [name, sent] {
+            Instance client(name);
+            return client.sendRequest(sent, [] { return Context{}; });
+        });
+        QTRY_COMPARE(received.count(), 1);
+        QCOMPARE(outcome.get(), Instance::Showed);
+        const auto gotReq = received.first().at(1).value<Instance::Request>();
+        QCOMPARE(gotReq, sent);
+    }
+
+    void gatherKeepsSelectionWithoutWindowIdAndCapsHugeClipboard() {
+        QTemporaryDir dir;
+        const QString hyprctl = dir.filePath("hyprctl");
+        write(hyprctl, "#!/bin/sh\nprintf '{\"class\":\"xwayland-app\",\"title\":\"Legacy\",\"stableId\":\"not-hex!\"}'\n");
+        QVERIFY(QFile::setPermissions(hyprctl, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        const QString wlPaste = dir.filePath("wl-paste");
+        // Emit 120 KB of 3-byte UTF-8 ("€" = \342\202\254; 80000 % 3 == 2 splits a code point at maxBytes) then sleep.
+        write(wlPaste, "#!/bin/sh\nLC_ALL=C awk 'BEGIN { for (i = 0; i < 40000; i++) printf \"\\342\\202\\254\"; fflush() }'\nsleep 5\n");
+        QVERIFY(QFile::setPermissions(wlPaste, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        Context::Sources sources;
+        sources.hyprSocket = dir.filePath("no-socket");
+        sources.hyprctl = hyprctl;
+        sources.wlPaste = wlPaste;
+        sources.selectionTimeoutMs = 1500;
+
+        QElapsedTimer timer;
+        timer.start();
+        const Context ctx = Context::gather(sources);
+        QVERIFY2(timer.elapsed() < 2000, "incremental read should stop before sleep finishes");
+        QVERIFY(ctx.stableId.isEmpty());
+        QCOMPARE(ctx.appClass, QString("xwayland-app"));
+        QCOMPARE(ctx.selection.size(), int(Context::kMaxSelection));
+        QVERIFY(!ctx.selection.contains(QChar::ReplacementCharacter));
+    }
+
+    void failedSendRestoresAttachmentsAndKeepsOwnedFiles() {
+        Rig rig;
+        Backend backend(rig.fx, rig.state, rig.paths());
+        backend.applyContext(Context{"firefox", "Report", "180000a8", "important quote"});
+        backend.toggleScreen();
+        QTRY_COMPARE(backend.attachments()->at(1)->state, Attachment::Ready);
+        const QString screenPath = backend.attachments()->at(1)->payload;
+        QVERIFY(QFile::exists(screenPath));
+
+        QVERIFY(backend.send("fail"));
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Failed, 5000);
+        // Both chips and the captured file must still be present so Retry works.
+        QCOMPARE(backend.attachments()->rowCount(), 2);
+        QVERIFY(backend.attachments()->at(0)->enabled);
+        QVERIFY(backend.attachments()->at(1)->enabled);
+        QVERIFY(QFile::exists(screenPath));
+
+        QVERIFY(backend.send("retry ok"));
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+        QCOMPARE(backend.attachments()->rowCount(), 0);
+        QVERIFY(!QFile::exists(screenPath));
+    }
+
+    void textFilesPortalPickerAndScreenOrdinal() {
+        Rig rig;
+        Backend backend(rig.fx, rig.state, rig.paths());
+        const QString codeFile = rig.dir.filePath("snippet.cpp");
+        write(codeFile, "int answer() { return 42; }\n");
+        const QString binFile = rig.dir.filePath("blob.bin");
+        write(binFile, QByteArray("abc\0def", 7));
+        const QString imgFile = rig.dir.filePath("first.png");
+        QImage(2, 2, QImage::Format_RGB32).save(imgFile);
+
+        class FakePicker : public FilePicker {
+        public:
+            QList<QUrl> urls;
+            void openFiles(QWindow *, std::function<void(const QList<QUrl> &)> done) override { done(urls); }
+        };
+        auto picker = std::make_unique<FakePicker>();
+        picker->urls = {QUrl::fromLocalFile(imgFile), QUrl::fromLocalFile(codeFile), QUrl::fromLocalFile(binFile)};
+        backend.setFilePicker(std::move(picker));
+        backend.pickFiles();
+        QCOMPARE(backend.attachments()->rowCount(), 2);  // binary rejected
+
+        // Test assemblePrompt when an Image comes before Screen in the list.
+        Attachment firstImg;
+        firstImg.kind = Attachment::Image;
+        firstImg.payload = imgFile;
+        Attachment secondScreen;
+        secondScreen.kind = Attachment::Screen;
+        secondScreen.app = "Firefox";
+        secondScreen.payload = "/run/s.jpg";
+        Attachment fileChip;
+        fileChip.kind = Attachment::File;
+        fileChip.label = "snippet.cpp";
+        fileChip.payload = "int x = 1;";
+        const AssembledPrompt assembled = assemblePrompt("check", {firstImg, secondScreen, fileChip});
+        QCOMPARE(assembled.images, (QStringList{imgFile, "/run/s.jpg"}));
+        QVERIFY(assembled.text.contains("Attached image #2 is a screenshot of the Firefox window."));
+        QVERIFY(assembled.text.contains("Attached file \"snippet.cpp\":"));
+        QVERIFY(assembled.text.contains("int x = 1;"));
+    }
+
+    void regionCaptureHidesRunsSlurpAndGrimAndReshows() {
+        Rig rig;
+        const QString slurp = rig.dir.filePath("slurp");
+        write(slurp, "#!/bin/sh\nif [ \"$FAKE_SLURP\" = cancel ]; then exit 1; fi\nprintf '10,20 300x200\\n'\n");
+        QVERIFY(QFile::setPermissions(slurp, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        Backend::Paths paths = rig.paths();
+        paths.slurp = slurp;
+        Backend backend(rig.fx, rig.state, paths);
+        QSignalSpy hideSpy(&backend, &Backend::hideWindowRequested);
+        QSignalSpy showSpy(&backend, &Backend::showWindowRequested);
+
+        qputenv("FAKE_SLURP", "cancel");
+        backend.captureRegion();
+        QTRY_COMPARE(showSpy.count(), 1);
+        QCOMPARE(hideSpy.count(), 1);
+        QCOMPARE(backend.attachments()->rowCount(), 0);
+
+        qunsetenv("FAKE_SLURP");
+        backend.captureRegion();
+        QTRY_COMPARE(showSpy.count(), 2);
+        QCOMPARE(backend.attachments()->rowCount(), 1);
+        QCOMPARE(backend.attachments()->at(0)->kind, Attachment::Image);
+        QVERIFY(backend.attachments()->at(0)->owned);
+        QVERIFY(rig.grimCalls().last().contains("|-g|10,20 300x200|"));
+    }
+
+    void modelMetadataEffortsAndFastMode() {
+        Rig rig;
+        Backend backend(rig.fx, rig.state, rig.paths());
+        backend.loadModels();
+        QTRY_COMPARE(backend.modelsState(), Backend::ModelsReady);
+        QCOMPARE(backend.modelEntries().size(), 3);
+
+        backend.setModel("vendor/alpha-1");
+        QCOMPARE(backend.availableEfforts(), (QStringList{"low", "medium", "high"}));
+        QVERIFY(backend.supportsFast());
+        backend.setEffort("high");
+        backend.setFast(true);
+
+        backend.send("check flags");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+        const QString firstCall = rig.calls().last();
+        QVERIFY(firstCall.contains("|--model|vendor/alpha-1|"));
+        QVERIFY(firstCall.contains("|--effort|high|"));
+        QVERIFY(firstCall.contains("|--fast|"));
+
+        // Switching to a model without efforts/fast must not pass unsupported flags.
+        backend.setModel("gamma");
+        QVERIFY(backend.availableEfforts().isEmpty());
+        QVERIFY(!backend.supportsFast());
+        backend.send("plain model");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+        const QString secondCall = rig.calls().last();
+        QVERIFY(!secondCall.contains("|--effort|"));
+        QVERIFY(!secondCall.contains("|--fast|"));
+    }
+
+    void historyPersistsReloadsDeletesAndPrunesWorkspaces() {
+        Rig rig;
+        {
+            Backend backend(rig.fx, rig.state, rig.paths());
+            backend.send("first topic");
+            QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+            backend.newChat();
+            backend.send("second topic");
+            QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+            QCOMPARE(backend.recentChats().size(), 2);
+        }
+
+        // Create an orphan workspace directory and verify prune removes it.
+        const QString orphan = History::chatsDir(rig.state) + "/orphan-dir";
+        QVERIFY(QDir().mkpath(orphan));
+
+        Backend reopened(rig.fx, rig.state, rig.paths());
+        const QVariantList chats = reopened.recentChats();
+        QCOMPARE(chats.size(), 2);
+        QVERIFY(!QDir(orphan).exists());
+
+        const QString firstId = chats.last().toMap().value("id").toString();
+        QVERIFY(reopened.loadChat(firstId));
+        QCOMPARE(reopened.messages()->count(), 2);
+        QCOMPARE(reopened.lastQuestion(), QString("first topic"));
+
+        QVERIFY(reopened.deleteChat(firstId));
+        QCOMPARE(reopened.recentChats().size(), 1);
+    }
+
+    void regenerateAndEditLastQuestion() {
+        Rig rig;
+        Backend backend(rig.fx, rig.state, rig.paths());
+        backend.send("initial question");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+        QCOMPARE(backend.messages()->count(), 2);
+
+        QVERIFY(backend.regenerate());
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+        QCOMPARE(backend.messages()->count(), 2);
+        QCOMPARE(rig.calls().size(), 2);
+
+        const QString edited = backend.editLastQuestion();
+        QCOMPARE(edited, QString("initial question"));
+        QCOMPARE(backend.messages()->count(), 0);
+    }
+
+    void markdownFencedCodeBlocksAndSanitizer() {
+        const QString md =
+            "Before ![pic](https://evil.example/a.png)\n\n"
+            "````markdown\n"
+            "Here is nested:\n"
+            "```sh\n"
+            "echo ![keep](https://inside.code/b.png)\n"
+            "```\n"
+            "````\n\n"
+            "~~~python\n"
+            "print(42)\n"
+            "~~~";
+        const QString sanitized = MessagesModel::sanitize(md);
+        QVERIFY(!sanitized.contains("evil.example"));
+        QVERIFY(sanitized.contains("![keep](https://inside.code/b.png)"));
+
+        const QList<MarkdownBlock> blocks = parseMarkdownBlocks(sanitized);
+        QCOMPARE(blocks.size(), 3);
+        QVERIFY(!blocks.at(0).isCode);
+        QVERIFY(blocks.at(1).isCode);
+        QCOMPARE(blocks.at(1).language, QString("markdown"));
+        QVERIFY(blocks.at(1).body.contains("```sh"));
+        QVERIFY(blocks.at(2).isCode);
+        QCOMPARE(blocks.at(2).language, QString("python"));
+        QCOMPARE(extractLastCodeBlock(sanitized), QString("print(42)"));
+
+        // Unclosed streaming fence still parses as a code block.
+        const QList<MarkdownBlock> streaming = parseMarkdownBlocks("Intro\n```cpp\nint a = 1;");
+        QCOMPARE(streaming.size(), 2);
+        QVERIFY(streaming.at(1).isCode);
+        QCOMPARE(streaming.at(1).language, QString("cpp"));
+        QCOMPARE(streaming.at(1).body, QString("int a = 1;"));
+    }
+
+    void customAndLocalizedCommands() {
+        Rig rig;
+        const QString cmdFile = rig.dir.filePath("commands.json");
+        write(cmdFile, R"([{"id":"bugs","title":"Spot Bugs","prompt":"Find bugs in this code.","requiresSelection":true}])");
+        Backend::Paths paths = rig.paths().withCommands(cmdFile);
+        Backend backend(rig.fx, rig.state, paths);
+        backend.setUiLanguage("da");
+
+        const QVariantList daCommands = backend.commandsForLanguage("da");
+        bool hasLocalTranslate = false;
+        bool hasCustom = false;
+        for (const QVariant &v : daCommands) {
+            const QVariantMap map = v.toMap();
+            if (map.value("id").toString() == "translateToLocal")
+                hasLocalTranslate = true;
+            if (map.value("id").toString() == "bugs" && map.value("title").toString() == "Spot Bugs" && map.value("isCustom").toBool())
+                hasCustom = true;
+        }
+        QVERIFY(hasLocalTranslate);
+        QVERIFY(hasCustom);
+
+        backend.applyContext(Context{"Alacritty", "vim", "", "int *p = nullptr; *p = 1;"});
+        QVERIFY(backend.runCommand("bugs"));
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+        QVERIFY(rig.calls().last().contains("Find bugs in this code."));
+    }
+
+    void themeReadsLightAndDarkColorsToml() {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("colors.toml");
+        write(path,
+              "mode = \"light\"\n"
+              "accent = \"#0055cc\"\n"
+              "background = \"#fafafa\"\n"
+              "darker_background = \"#f0f0f2\"\n"
+              "foreground = \"#18181b\"\n"
+              "muted = \"#71717a\"\n"
+              "red = \"#dc2626\"\n");
+        const Theme::Colors light = Theme::readColors(path);
+        QVERIFY(light.light);
+        QCOMPARE(light.accent, QString("#0055cc"));
+        QCOMPARE(light.surface, QString("#fafafa"));
+        QCOMPARE(light.text, QString("#18181b"));
+        QCOMPARE(light.danger, QString("#dc2626"));
+    }
+
+    void cliParsingAndHeadlessQuery() {
+        auto runParse = [](std::initializer_list<const char *> args) {
+            QVector<QByteArray> storage;
+            QVector<char *> argv;
+            for (const char *a : args) {
+                storage.push_back(QByteArray(a));
+                argv.push_back(storage.last().data());
+            }
+            return parseCli(argv.size(), argv.data());
+        };
+        QCOMPARE(runParse({"ask"}).mode, ParsedCli::ToggleGui);
+        QCOMPARE(runParse({"ask", "--background"}).mode, ParsedCli::BackgroundGui);
+        QCOMPARE(runParse({"ask", "--help"}).mode, ParsedCli::PrintHelp);
+        QCOMPARE(runParse({"ask", "--version"}).mode, ParsedCli::PrintVersion);
+        QCOMPARE(runParse({"ask", "--bogus"}).mode, ParsedCli::Error);
+
+        const ParsedCli open = runParse({"ask", "open", "--new", "--model", "m1", "hello", "world"});
+        QCOMPARE(open.mode, ParsedCli::OpenGui);
+        QVERIFY(open.newChat);
+        QCOMPARE(open.model, QString("m1"));
+        QCOMPARE(open.prompt, QString("hello world"));
+
+        Rig rig;
+        const QString note = rig.dir.filePath("note.txt");
+        write(note, "context line");
+        const QByteArray noteUtf8 = note.toUtf8();
+        ParsedCli q = runParse({"ask", "query", "--model", "vendor/alpha-1", "--effort", "low",
+                                "--fast", "--no-save", "--file", noteUtf8.constData(), "--json", "summarize"});
+        QCOMPARE(q.mode, ParsedCli::QueryHeadless);
+        char prog[] = "ask";
+        char *argv[] = {prog};
+        QCOMPARE(runHeadlessQuery(q, 1, argv, rig.fx), 0);
+        const QString call = rig.calls().last();
+        QVERIFY(call.contains("|--model|vendor/alpha-1|"));
+        QVERIFY(call.contains("|--effort|low|"));
+        QVERIFY(call.contains("|--fast|"));
+        QVERIFY(call.contains("|--no-save|"));
+        QVERIFY(call.contains("context line"));
+    }
+
+    void qmlUiRendersAllPanelsAndStatesWithoutWarnings() {
+        QQuickStyle::setStyle("Basic");
+        Rig rig;
+        const QString themeDir = rig.dir.filePath("theme");
+        QVERIFY(QDir().mkpath(themeDir));
+        write(themeDir + "/colors.toml",
+              "mode = \"light\"\naccent = \"#0055cc\"\nbackground = \"#fafafa\"\n"
+              "darker_background = \"#f0f0f2\"\nforeground = \"#18181b\"\n"
+              "muted = \"#71717a\"\nred = \"#dc2626\"\n");
+
+        Translator translator(rig.dir.filePath("language"), QString(SRC_DIR) + "/i18n");
+        Theme theme(themeDir, nullptr, "/nonexistent/hyprctl");
+        Backend backend(rig.fx, rig.state, rig.paths());
+        backend.setUiLanguage("da");
+
+        static QStringList qmlWarnings;
+        qmlWarnings.clear();
+        const QtMessageHandler prevHandler = qInstallMessageHandler(
+            [](QtMsgType type, const QMessageLogContext &, const QString &msg) {
+                if (type >= QtWarningMsg)
+                    qmlWarnings << msg;
+            });
+        const auto restore = qScopeGuard([prevHandler] { qInstallMessageHandler(prevHandler); });
+
+        static bool typesRegistered = false;
+        if (!typesRegistered) {
+            qmlRegisterSingletonType(QUrl("qrc:/Palette.qml"), "Ask", 1, 0, "Palette");
+            qmlRegisterUncreatableType<Backend>("Ask", 1, 0, "Backend", "provided by the application");
+            typesRegistered = true;
+        }
+
+        QQmlApplicationEngine engine;
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.load(QUrl("qrc:/Main.qml"));
+        auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().value(0));
+        QVERIFY(window != nullptr);
+        window->show();
+
+        // Exercise selection + screen + file chips.
+        const QString notePath = rig.dir.filePath("notes.md");
+        write(notePath, "# Heading\nsome utf-8 text\n");
+        backend.applyContext(Context{"org.mozilla.firefox", "Spec", "180000a8", "selected paragraph"});
+        backend.toggleScreen();
+        QTRY_COMPARE(backend.attachments()->at(1)->state, Attachment::Ready);
+        QCOMPARE(backend.addFiles({QUrl::fromLocalFile(notePath)}), 1);
+
+        // Exercise models, efforts, fast badge, actions, history, and shortcuts overlay.
+        QVERIFY(QMetaObject::invokeMethod(window, "openModels"));
+        QTRY_COMPARE(backend.modelsState(), Backend::ModelsReady);
+        backend.setModel("vendor/alpha-1");
+        backend.setEffort("high");
+        backend.setFast(true);
+        QVERIFY(QMetaObject::invokeMethod(window, "openEfforts"));
+        QTest::qWait(30);
+        QVERIFY(QMetaObject::invokeMethod(window, "openActions"));
+        QTest::qWait(30);
+
+        // Send a turn with a fenced code block (via saved history) and a failed turn with Retry button.
+        QVERIFY(backend.send("fail"));
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Failed, 5000);
+        QTest::qWait(30);
+
+        backend.newChat();
+        QVERIFY(backend.send("hello"));
+        QTRY_COMPARE_WITH_TIMEOUT(backend.status(), Backend::Idle, 5000);
+        QVERIFY(QMetaObject::invokeMethod(window, "openHistory"));
+        QTest::qWait(30);
+
+        window->setProperty("helpVisible", true);
+        QTest::qWait(30);
+        QImage frame = window->grabWindow();
+        QVERIFY(!frame.isNull());
+
+        QVERIFY2(qmlWarnings.isEmpty(), qPrintable(qmlWarnings.join('\n')));
     }
 
     void danishCatalogCoversEveryUiString() {

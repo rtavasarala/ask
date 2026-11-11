@@ -25,7 +25,7 @@ Flow {
             readonly property bool failed: phase === 2
             readonly property bool capturing: phase === 1
             readonly property bool on: checked && !failed
-            readonly property string glyph: kind === 0 ? "❝" : kind === 1 ? "▣" : "▤"
+            readonly property string glyph: kind === 0 ? "❝" : kind === 1 ? "▣" : kind === 3 ? "≣" : "▤"
             readonly property string text: {
                 if (kind === 1) {
                     const base = label.length ? qsTr("%1 window").arg(label) : qsTr("Active window")
@@ -97,7 +97,7 @@ Flow {
                 height: tipText.implicitHeight + Palette.unit
                 x: Math.min(0, root.parent.width - Palette.unit * 2 - chip.mapToItem(root.parent, 0, 0).x - width)
                 radius: Math.min(6, theme.radius)
-                color: "#202023"
+                color: Palette.popover
                 border.color: Palette.border
                 Text {
                     id: tipText

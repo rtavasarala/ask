@@ -40,6 +40,7 @@ int main(int argc, char *argv[]) {
     Theme theme(scratch.filePath("theme"), nullptr, "/nonexistent/hyprctl");
     Backend backend(QString(SHOTS_DIR) + "/fx", scratch.filePath("state"),
                     {QString(SHOTS_DIR) + "/grim", scratch.filePath("run"), {}});
+    backend.setUiLanguage(translator.language());
     qmlRegisterSingletonType(QUrl("qrc:/Palette.qml"), "Ask", 1, 0, "Palette");
     qmlRegisterUncreatableType<Backend>("Ask", 1, 0, "Backend", "provided by the application");
 
