@@ -6,22 +6,14 @@ Item {
     id: root
     property string kind
     property string raw
-    property string markdown
-    required property var blocks
+    property var blocksModel: null
+    property bool hasText: false
     property string phase
     property string error
     property bool isLast: false
     property string note
 
     readonly property bool streaming: phase === "streaming"
-    // Indexed by count so existing delegates stay alive while chunks stream in.
-    readonly property var effectiveBlocks: {
-        if (blocks && blocks.length > 0)
-            return blocks
-        if (markdown.length > 0)
-            return [{isCode: false, language: "", body: markdown.replace(/\n$/, "")}]
-        return []
-    }
 
     implicitHeight: kind === "user" ? userLine.implicitHeight + 8 : answer.implicitHeight + 8
 
@@ -62,6 +54,149 @@ Item {
         }
     }
 
+    Component {
+        id: proseComponent
+        TextEdit {
+            id: prose
+            readonly property var targetEdit: prose
+            readonly property real editOffsetX: 0
+            readonly property real editOffsetY: 0
+            width: parent ? parent.width : 0
+            height: implicitHeight
+            readOnly: true
+            selectByMouse: true
+            textFormat: TextEdit.MarkdownText
+            text: parent ? parent.blockBody : ""
+            wrapMode: TextEdit.Wrap
+            color: Palette.text
+            font.pixelSize: 14
+            selectionColor: theme.accent
+            selectedTextColor: theme.accentForeground
+            onLinkActivated: link => { if (/^https?:/i.test(link)) Qt.openUrlExternally(link) }
+        }
+    }
+
+    Component {
+        id: codeComponent
+        Rectangle {
+            id: codeBox
+            readonly property var targetEdit: code
+            readonly property real editOffsetX: code.x
+            readonly property real editOffsetY: code.y
+            readonly property string blockLanguage: parent ? parent.blockLanguage : ""
+            readonly property string blockBody: parent ? parent.blockBody : ""
+            width: parent ? parent.width : 0
+            height: code.y + code.implicitHeight + Palette.unit
+            radius: Math.min(6, theme.radius)
+            color: Palette.codeBackground
+            border.color: Palette.divider
+
+            Item {
+                id: codeHeader
+                width: parent.width
+                height: 26
+
+                Text {
+                    x: Palette.unit + 2
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.max(0, copyAction.x - x - Palette.unit)
+                    text: codeBox.blockLanguage.length > 0 ? codeBox.blockLanguage : qsTr("code")
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    color: Palette.faint
+                    font.family: Palette.mono
+                    font.pixelSize: 11
+                }
+
+                Item {
+                    id: copyAction
+                    property bool copied: false
+                    anchors.right: parent.right
+                    anchors.rightMargin: Palette.unit - 2
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: copyLabel.implicitWidth + Palette.unit * 1.5
+                    height: 20
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: Math.min(4, theme.radius)
+                        color: copyHover.hovered ? Palette.hover : "transparent"
+                    }
+                    Text {
+                        id: copyLabel
+                        anchors.centerIn: parent
+                        text: copyAction.copied ? ("✓ " + qsTr("Copied")) : qsTr("Copy")
+                        textFormat: Text.PlainText
+                        color: copyAction.copied ? theme.accent : (copyHover.hovered ? Palette.text : Palette.dim)
+                        font.pixelSize: 11
+                    }
+                    HoverHandler { id: copyHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler {
+                        enabled: codeBox.blockBody.length > 0
+                        onTapped: {
+                            backend.copyText(codeBox.blockBody)
+                            copyAction.copied = true
+                            copiedTimer.restart()
+                        }
+                    }
+                    Timer {
+                        id: copiedTimer
+                        interval: 1200
+                        onTriggered: copyAction.copied = false
+                    }
+                }
+            }
+
+            Rectangle {
+                y: codeHeader.height
+                width: parent.width
+                height: 1
+                color: Palette.divider
+            }
+
+            TextEdit {
+                id: code
+                x: Palette.unit + 2
+                y: codeHeader.height + 1 + Palette.unit
+                width: parent.width - Palette.unit * 2 - 4
+                readOnly: true
+                selectByMouse: true
+                textFormat: TextEdit.PlainText
+                text: codeBox.blockBody
+                wrapMode: TextEdit.Wrap
+                color: Palette.text
+                font.family: Palette.mono
+                font.pixelSize: 13
+                selectionColor: theme.accent
+                selectedTextColor: theme.accentForeground
+            }
+        }
+    }
+
+    Component {
+        id: cursorComponent
+        Rectangle {
+            readonly property var edit: parent ? parent.targetEdit : null
+            readonly property var end: {
+                if (!edit)
+                    return {x: 0, y: 0, height: 16}
+                edit.length; edit.width; edit.contentHeight
+                return edit.positionToRectangle(edit.length)
+            }
+            x: (parent ? parent.offsetX : 0) + end.x + 1
+            y: (parent ? parent.offsetY : 0) + end.y + 2
+            width: 2
+            height: Math.max(12, end.height - 4)
+            color: theme.accent
+            SequentialAnimation on opacity {
+                running: true
+                loops: Animation.Infinite
+                NumberAnimation { from: 1; to: 0.15; duration: 500; easing.type: Easing.OutQuad }
+                NumberAnimation { from: 0.15; to: 1; duration: 500; easing.type: Easing.OutQuad }
+            }
+        }
+    }
+
     Column {
         id: answer
         visible: root.kind === "assistant"
@@ -69,150 +204,40 @@ Item {
         spacing: Palette.unit
 
         Repeater {
-            model: root.effectiveBlocks.length
+            id: blockRepeater
+            model: root.kind === "assistant" ? root.blocksModel : null
             delegate: Item {
                 id: part
                 required property int index
-                readonly property var block: root.effectiveBlocks[index] || ({isCode: false, language: "", body: ""})
-                readonly property bool isCode: Boolean(block.isCode)
-                readonly property string language: block.language || ""
-                readonly property string body: block.body || ""
-                readonly property bool last: index === root.effectiveBlocks.length - 1
+                required property bool isCode
+                required property string language
+                required property string body
+                readonly property bool last: index === blockRepeater.count - 1
                 visible: isCode || body.length > 0
                 width: answer.width
-                height: visible ? (isCode ? codeBox.height : prose.implicitHeight) : -answer.spacing
+                height: visible ? (blockLoader.item ? blockLoader.item.height : 0) : -answer.spacing
 
-                TextEdit {
-                    id: prose
-                    visible: !part.isCode
+                Loader {
+                    id: blockLoader
                     width: parent.width
-                    readOnly: true
-                    selectByMouse: true
-                    textFormat: TextEdit.MarkdownText
-                    text: part.body
-                    wrapMode: TextEdit.Wrap
-                    color: Palette.text
-                    font.pixelSize: 14
-                    selectionColor: theme.accent
-                    selectedTextColor: theme.accentForeground
-                    onLinkActivated: link => { if (/^https?:/i.test(link)) Qt.openUrlExternally(link) }
-                }
-
-                Rectangle {
-                    id: codeBox
-                    visible: part.isCode
-                    width: parent.width
-                    height: code.y + code.implicitHeight + Palette.unit
-                    radius: Math.min(6, theme.radius)
-                    color: Palette.codeBackground
-                    border.color: Palette.divider
-
-                    Item {
-                        id: codeHeader
-                        width: parent.width
-                        height: 26
-
-                        Text {
-                            x: Palette.unit + 2
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Math.max(0, copyAction.x - x - Palette.unit)
-                            text: part.language.length > 0 ? part.language : qsTr("code")
-                            textFormat: Text.PlainText
-                            elide: Text.ElideRight
-                            color: Palette.faint
-                            font.family: Palette.mono
-                            font.pixelSize: 11
-                        }
-
-                        Item {
-                            id: copyAction
-                            property bool copied: false
-                            anchors.right: parent.right
-                            anchors.rightMargin: Palette.unit - 2
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: copyLabel.implicitWidth + Palette.unit * 1.5
-                            height: 20
-
-                            Rectangle {
-                                anchors.fill: parent
-                                radius: Math.min(4, theme.radius)
-                                color: copyHover.hovered ? Palette.hover : "transparent"
-                            }
-                            Text {
-                                id: copyLabel
-                                anchors.centerIn: parent
-                                text: copyAction.copied ? ("✓ " + qsTr("Copied")) : qsTr("Copy")
-                                textFormat: Text.PlainText
-                                color: copyAction.copied ? theme.accent : (copyHover.hovered ? Palette.text : Palette.dim)
-                                font.pixelSize: 11
-                            }
-                            HoverHandler { id: copyHover; cursorShape: Qt.PointingHandCursor }
-                            TapHandler {
-                                enabled: part.body.length > 0
-                                onTapped: {
-                                    backend.copyText(part.body)
-                                    copyAction.copied = true
-                                    copiedTimer.restart()
-                                }
-                            }
-                            Timer {
-                                id: copiedTimer
-                                interval: 1200
-                                onTriggered: copyAction.copied = false
-                            }
-                        }
-                    }
-
-                    Rectangle {
-                        y: codeHeader.height
-                        width: parent.width
-                        height: 1
-                        color: Palette.divider
-                    }
-
-                    TextEdit {
-                        id: code
-                        x: Palette.unit + 2
-                        y: codeHeader.height + 1 + Palette.unit
-                        width: parent.width - Palette.unit * 2 - 4
-                        readOnly: true
-                        selectByMouse: true
-                        textFormat: TextEdit.PlainText
-                        text: part.body
-                        wrapMode: TextEdit.Wrap
-                        color: Palette.text
-                        font.family: Palette.mono
-                        font.pixelSize: 13
-                        selectionColor: theme.accent
-                        selectedTextColor: theme.accentForeground
-                    }
+                    readonly property string blockLanguage: part.language
+                    readonly property string blockBody: part.body
+                    sourceComponent: part.isCode ? codeComponent : proseComponent
                 }
 
                 // Follows the end of the text while the answer streams in.
-                Rectangle {
-                    readonly property var end: {
-                        const edit = part.isCode ? code : prose
-                        edit.length; edit.width; edit.contentHeight
-                        return edit.positionToRectangle(edit.length)
-                    }
-                    visible: root.streaming && part.last
-                    x: (part.isCode ? codeBox.x + code.x : prose.x) + end.x + 1
-                    y: (part.isCode ? codeBox.y + code.y : prose.y) + end.y + 2
-                    width: 2
-                    height: Math.max(12, end.height - 4)
-                    color: theme.accent
-                    SequentialAnimation on opacity {
-                        running: parent.visible
-                        loops: Animation.Infinite
-                        NumberAnimation { from: 1; to: 0.15; duration: 500; easing.type: Easing.OutQuad }
-                        NumberAnimation { from: 0.15; to: 1; duration: 500; easing.type: Easing.OutQuad }
-                    }
+                Loader {
+                    active: root.streaming && part.last && blockLoader.item !== null
+                    readonly property var targetEdit: blockLoader.item ? blockLoader.item.targetEdit : null
+                    readonly property real offsetX: blockLoader.item ? blockLoader.item.editOffsetX : 0
+                    readonly property real offsetY: blockLoader.item ? blockLoader.item.editOffsetY : 0
+                    sourceComponent: cursorComponent
                 }
             }
         }
 
         StatusDot {
-            visible: root.streaming && root.raw.length === 0
+            visible: root.streaming && !root.hasText
         }
 
         Column {

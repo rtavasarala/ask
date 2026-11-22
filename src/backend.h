@@ -11,7 +11,9 @@
 #include <utility>
 
 #include "attachmentsmodel.h"
+#include "commands.h"
 #include "filepicker.h"
+#include "history.h"
 #include "messagesmodel.h"
 #include "settings.h"
 
@@ -155,8 +157,27 @@ private:
     void restoreInFlight();
     void release(const QList<Attachment> &attachments);
     void saveSettings() const;
+    QString resolveFx() const;
+    const QList<AiCommand> &customCommands() const;
+    void resetChatState();
+
+    struct FileStamp {
+        bool exists = false;
+        quint64 inode = 0;
+        qint64 size = -1;
+        qint64 mtimeSec = -1;
+        qint64 mtimeNsec = -1;
+
+        bool operator==(const FileStamp &other) const {
+            return exists == other.exists && inode == other.inode && size == other.size
+                   && mtimeSec == other.mtimeSec && mtimeNsec == other.mtimeNsec;
+        }
+        bool operator!=(const FileStamp &other) const { return !(*this == other); }
+    };
+    static FileStamp statFile(const QString &path);
 
     QString m_fxPath, m_stateDir, m_workspace, m_grim, m_slurp, m_runtimeDir, m_settingsFile;
+    mutable QString m_resolvedFx;
     Paths m_paths;
     MessagesModel m_messages;
     AttachmentsModel m_attachments;
@@ -168,6 +189,12 @@ private:
     bool m_canResume = false;
     bool m_capturingRegion = false;
     mutable bool m_prunedOnStartup = false;
+    mutable bool m_hasCachedChats = false;
+    mutable FileStamp m_cachedChatsStamp;
+    mutable QList<ChatSummary> m_cachedChats;
+    mutable bool m_hasCachedCommands = false;
+    mutable FileStamp m_cachedCommandsStamp;
+    mutable QList<AiCommand> m_cachedCommands;
     QString m_model;
     QString m_effort;
     bool m_fast = false;

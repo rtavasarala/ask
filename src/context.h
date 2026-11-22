@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QJsonObject>
 #include <QMetaType>
 #include <QString>
 #include <optional>
@@ -18,6 +19,8 @@ struct Context {
     // Parses and bounds one untrusted JSON object. Anything malformed (not an
     // object, a non-string field, a stableId that is not hex) yields nullopt.
     static std::optional<Context> fromJson(const QByteArray &json);
+    static std::optional<Context> fromJsonObject(const QJsonObject &object);
+    QJsonObject toJsonObject() const;
     QByteArray toJson() const;
 
     // Reads the active window from Hyprland and the primary selection from

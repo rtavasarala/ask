@@ -3,9 +3,38 @@
 #include <QAbstractListModel>
 #include <QList>
 #include <QVariant>
+#include <memory>
+#include <vector>
+
+#include "markdown.h"
+
+// Per-message block list so streaming updates touch only the active tail block.
+class MessageBlocksModel : public QAbstractListModel {
+    Q_OBJECT
+    Q_PROPERTY(int count READ rowCount NOTIFY countChanged)
+
+public:
+    enum Roles { IsCodeRole = Qt::UserRole + 1, LanguageRole, BodyRole };
+
+    explicit MessageBlocksModel(QObject *parent = nullptr) : QAbstractListModel(parent) {}
+
+    int rowCount(const QModelIndex &parent = {}) const override;
+    QVariant data(const QModelIndex &index, int role) const override;
+    QHash<int, QByteArray> roleNames() const override;
+
+    void setBlocks(QList<MarkdownBlock> blocks);
+    void syncFrom(int startIndex, const QList<MarkdownBlock> &tail);
+    QVariantList toVariantList() const;
+
+signals:
+    void countChanged();
+
+private:
+    QList<MarkdownBlock> m_blocks;
+};
 
 // The conversation as QML sees it. `text` is the raw Markdown from the model;
-// `display` and `blocks` are what the view renders, after the sanitizer.
+// `display`, `blocks`, and `blocksModel` are what the view renders, after the sanitizer.
 class MessagesModel : public QAbstractListModel {
     Q_OBJECT
     Q_PROPERTY(int count READ count NOTIFY countChanged)
@@ -13,13 +42,23 @@ class MessagesModel : public QAbstractListModel {
     Q_PROPERTY(bool hasLastCodeBlock READ hasLastCodeBlock NOTIFY lastHasTextChanged)
 
 public:
-    enum Roles { RoleRole = Qt::UserRole + 1, TextRole, DisplayRole, StateRole, NoteRole, BlocksRole };
+    enum Roles {
+        RoleRole = Qt::UserRole + 1,
+        TextRole,
+        DisplayRole,
+        StateRole,
+        NoteRole,
+        BlocksRole,
+        BlocksModelRole,
+        HasTextRole,
+    };
 
     struct Turn {
         QString role, text, state, note;
     };
 
     explicit MessagesModel(QObject *parent = nullptr) : QAbstractListModel(parent) {}
+    ~MessagesModel() override = default;
 
     int rowCount(const QModelIndex &parent = {}) const override;
     QVariant data(const QModelIndex &index, int role) const override;
@@ -39,8 +78,8 @@ public:
     void setTurns(const QList<Turn> &turns);
     QString removeLastTurn();
 
-    int count() const { return m_rows.size(); }
-    bool lastHasText() const { return !m_rows.isEmpty() && !m_rows.last().text.isEmpty(); }
+    int count() const { return int(m_rows.size()); }
+    bool lastHasText() const { return !m_rows.empty() && !m_rows.back()->text.isEmpty(); }
     QString lastText(const QString &role) const;
     QString lastCodeBlock() const;
     bool hasLastCodeBlock() const { return !lastCodeBlock().isEmpty(); }
@@ -50,12 +89,27 @@ signals:
     void lastHasTextChanged();
 
 private:
-    struct Row {
-        QString role, text, display, state, note, lastCode;
-        QVariantList blocks;
+    struct ParseState {
+        qsizetype lineStart = 0;
+        bool inCode = false;
+        MarkdownFence activeFence;
+        QString activeProse;
+        bool activeProseHasImageCandidate = false;
+        QString activeCode;
+        int finalizedBlockCount = 0;
+        QString finalizedLastCode;
     };
-    static Row makeRow(const QString &role, const QString &text, const QString &state, const QString &note);
-    static void updateDerived(Row &row);
 
-    QList<Row> m_rows;
+    struct Row {
+        QString role, text, state, note, lastCode;
+        mutable QString display;
+        mutable bool displayDirty = true;
+        ParseState parse;
+        MessageBlocksModel *blocksModel = nullptr;
+    };
+
+    std::unique_ptr<Row> makeRow(const QString &role, const QString &text, const QString &state, const QString &note);
+    void advanceRow(Row &row);
+
+    std::vector<std::unique_ptr<Row>> m_rows;
 };
