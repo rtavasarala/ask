@@ -19,24 +19,22 @@ bool isValidChatId(const QString &id) {
            && !id.contains('/') && !id.contains('\\');
 }
 
+QString cleanAbsPath(const QString &path) {
+    return path.isEmpty() ? QString() : QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+}
+
 // Ensures we only ever delete direct, non-symlink subdirectories of stateDir/chats
 // and never touch the active workspace.
-bool isSafeRemovableChatDir(const QString &chatsRoot, const QString &candidate, const QString &activeWorkspace) {
-    if (chatsRoot.isEmpty() || candidate.isEmpty())
+bool isSafeRemovableChatDirClean(const QString &cleanRoot, const QString &cleanTarget, const QString &cleanActive) {
+    if (cleanRoot.isEmpty() || cleanTarget.isEmpty() || cleanRoot == QLatin1String("/") || cleanTarget == cleanActive)
         return false;
-    const QString root = QDir::cleanPath(QFileInfo(chatsRoot).absoluteFilePath());
-    const QString target = QDir::cleanPath(QFileInfo(candidate).absoluteFilePath());
-    const QString active = activeWorkspace.isEmpty()
-        ? QString()
-        : QDir::cleanPath(QFileInfo(activeWorkspace).absoluteFilePath());
-    if (root.isEmpty() || root == QLatin1String("/") || target == active)
+    if (cleanTarget.size() <= cleanRoot.size() + 1 || !cleanTarget.startsWith(cleanRoot)
+        || cleanTarget.at(cleanRoot.size()) != QLatin1Char('/'))
         return false;
-    if (!target.startsWith(root + QLatin1Char('/')))
-        return false;
-    const QString rel = target.mid(root.size() + 1);
+    const QString rel = cleanTarget.mid(cleanRoot.size() + 1);
     if (!isValidChatId(rel))
         return false;
-    const QFileInfo info(target);
+    const QFileInfo info(cleanTarget);
     return info.exists() && info.isDir() && !info.isSymLink();
 }
 
@@ -48,12 +46,46 @@ QString firstUserTitle(const QList<MessagesModel::Turn> &turns) {
     return {};
 }
 
-void sortChatsNewestFirst(QList<SavedChat> &chats) {
-    std::stable_sort(chats.begin(), chats.end(), [](const SavedChat &a, const SavedChat &b) {
+QString firstUserTitleFromJson(const QJsonArray &turns) {
+    for (const QJsonValue &tv : turns) {
+        if (!tv.isObject())
+            continue;
+        const QJsonObject to = tv.toObject();
+        if (to.value(QLatin1String("role")).toString() == QLatin1String("user")) {
+            const QString text = to.value(QLatin1String("text")).toString();
+            if (!text.trimmed().isEmpty())
+                return oneLinePreview(text);
+        }
+    }
+    return {};
+}
+
+template <typename ChatList>
+void sortChatsNewestFirst(ChatList &chats) {
+    std::stable_sort(chats.begin(), chats.end(), [](const auto &a, const auto &b) {
         return a.updatedAt > b.updatedAt;
     });
 }
+
+void removeOrphanDirs(const QString &root, const QList<SavedChat> &chats, const QString &activeWorkspace) {
+    if (!QDir(root).exists())
+        return;
+    const QString cleanRoot = cleanAbsPath(root);
+    const QString cleanActive = cleanAbsPath(activeWorkspace);
+    QSet<QString> kept;
+    kept.reserve(chats.size() + 1);
+    for (const SavedChat &chat : chats)
+        kept.insert(cleanAbsPath(chat.workspace));
+    if (!cleanActive.isEmpty())
+        kept.insert(cleanActive);
+
+    for (const QFileInfo &entry : QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        const QString dirPath = QDir::cleanPath(entry.absoluteFilePath());
+        if (!kept.contains(dirPath) && isSafeRemovableChatDirClean(cleanRoot, dirPath, cleanActive))
+            QDir(dirPath).removeRecursively();
+    }
 }
+}  // namespace
 
 QString History::chatsDir(const QString &stateDir) {
     return QDir::cleanPath(stateDir) + QStringLiteral("/chats");
@@ -74,40 +106,97 @@ QList<SavedChat> History::load(const QString &stateDir) {
     if (err.error != QJsonParseError::NoError)
         return chats;
 
-    const QJsonArray array = doc.isArray() ? doc.array() : doc.object().value(QStringLiteral("chats")).toArray();
+    const QJsonArray array = doc.isArray() ? doc.array() : doc.object().value(QLatin1String("chats")).toArray();
+    const QString rootDir = chatsDir(stateDir);
+    chats.reserve(array.size());
     QSet<QString> seen;
+    seen.reserve(array.size());
+
     for (const QJsonValue &val : array) {
         if (!val.isObject())
             continue;
         const QJsonObject obj = val.toObject();
-        const QString id = obj.value(QStringLiteral("id")).toString().trimmed();
+        const QString id = obj.value(QLatin1String("id")).toString().trimmed();
         if (!isValidChatId(id) || seen.contains(id))
             continue;
         seen.insert(id);
 
         SavedChat chat;
         chat.id = id;
-        chat.workspace = obj.value(QStringLiteral("workspace")).toString().trimmed();
+        chat.workspace = obj.value(QLatin1String("workspace")).toString().trimmed();
         if (chat.workspace.isEmpty())
-            chat.workspace = chatsDir(stateDir) + QLatin1Char('/') + id;
-        chat.model = obj.value(QStringLiteral("model")).toString().trimmed();
-        chat.updatedAt = obj.value(QStringLiteral("updatedAt")).toInteger(0);
-        for (const QJsonValue &tv : obj.value(QStringLiteral("turns")).toArray()) {
+            chat.workspace = rootDir + QLatin1Char('/') + id;
+        chat.model = obj.value(QLatin1String("model")).toString().trimmed();
+        chat.updatedAt = obj.value(QLatin1String("updatedAt")).toInteger(0);
+        const QJsonArray turnsArr = obj.value(QLatin1String("turns")).toArray();
+        chat.turns.reserve(turnsArr.size());
+        for (const QJsonValue &tv : turnsArr) {
             if (!tv.isObject())
                 continue;
             const QJsonObject to = tv.toObject();
-            MessagesModel::Turn turn;
-            turn.role = to.value(QStringLiteral("role")).toString();
-            turn.text = to.value(QStringLiteral("text")).toString();
-            turn.state = to.value(QStringLiteral("state")).toString();
-            turn.note = to.value(QStringLiteral("note")).toString();
-            if (!turn.role.isEmpty())
-                chat.turns << turn;
+            QString role = to.value(QLatin1String("role")).toString();
+            if (role.isEmpty())
+                continue;
+            chat.turns.append({
+                std::move(role),
+                to.value(QLatin1String("text")).toString(),
+                to.value(QLatin1String("state")).toString(),
+                to.value(QLatin1String("note")).toString(),
+            });
         }
-        chat.title = obj.value(QStringLiteral("title")).toString().trimmed();
+        chat.title = obj.value(QLatin1String("title")).toString().trimmed();
         if (chat.title.isEmpty())
             chat.title = firstUserTitle(chat.turns);
-        chats << chat;
+        chats.append(std::move(chat));
+    }
+    sortChatsNewestFirst(chats);
+    return chats;
+}
+
+QList<ChatSummary> History::loadSummaries(const QString &stateDir) {
+    QList<ChatSummary> chats;
+    QFile file(indexPath(stateDir));
+    if (!file.open(QIODevice::ReadOnly))
+        return chats;
+
+    QJsonParseError err;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+    if (err.error != QJsonParseError::NoError)
+        return chats;
+
+    const QJsonArray array = doc.isArray() ? doc.array() : doc.object().value(QLatin1String("chats")).toArray();
+    const QString rootDir = chatsDir(stateDir);
+    chats.reserve(array.size());
+    QSet<QString> seen;
+    seen.reserve(array.size());
+
+    for (const QJsonValue &val : array) {
+        if (!val.isObject())
+            continue;
+        const QJsonObject obj = val.toObject();
+        const QString id = obj.value(QLatin1String("id")).toString().trimmed();
+        if (!isValidChatId(id) || seen.contains(id))
+            continue;
+        seen.insert(id);
+
+        ChatSummary chat;
+        chat.id = id;
+        chat.workspace = obj.value(QLatin1String("workspace")).toString().trimmed();
+        if (chat.workspace.isEmpty())
+            chat.workspace = rootDir + QLatin1Char('/') + id;
+        chat.model = obj.value(QLatin1String("model")).toString().trimmed();
+        chat.updatedAt = obj.value(QLatin1String("updatedAt")).toInteger(0);
+        const QJsonArray turnsArr = obj.value(QLatin1String("turns")).toArray();
+        int turnCount = 0;
+        for (const QJsonValue &tv : turnsArr) {
+            if (tv.isObject() && !tv.toObject().value(QLatin1String("role")).toString().isEmpty())
+                ++turnCount;
+        }
+        chat.turnCount = turnCount;
+        chat.title = obj.value(QLatin1String("title")).toString().trimmed();
+        if (chat.title.isEmpty())
+            chat.title = firstUserTitleFromJson(turnsArr);
+        chats.append(std::move(chat));
     }
     sortChatsNewestFirst(chats);
     return chats;
@@ -159,8 +248,9 @@ bool History::save(const QString &stateDir, const QList<SavedChat> &chats) {
 }
 
 bool History::upsert(const QString &stateDir, SavedChat chat) {
+    const QString root = chatsDir(stateDir);
     if (chat.workspace.isEmpty() && isValidChatId(chat.id))
-        chat.workspace = chatsDir(stateDir) + QLatin1Char('/') + chat.id;
+        chat.workspace = root + QLatin1Char('/') + chat.id;
     if (chat.id.isEmpty() && !chat.workspace.isEmpty())
         chat.id = QFileInfo(QDir::cleanPath(chat.workspace)).fileName();
     if (!isValidChatId(chat.id))
@@ -173,21 +263,25 @@ bool History::upsert(const QString &stateDir, SavedChat chat) {
     QList<SavedChat> chats = load(stateDir);
     const QString cleanWorkspace = QDir::cleanPath(chat.workspace);
     for (int i = chats.size() - 1; i >= 0; --i) {
-        if (chats.at(i).id == chat.id || QDir::cleanPath(chats.at(i).workspace) == cleanWorkspace)
+        if (chats.at(i).id == chat.id || QDir::cleanPath(chats.at(i).workspace) == cleanWorkspace
+            || !QFileInfo(chats.at(i).workspace).isDir()) {
             chats.removeAt(i);
+        }
     }
-    chats.prepend(chat);
+    if (QFileInfo(chat.workspace).isDir())
+        chats.prepend(chat);
     sortChatsNewestFirst(chats);
 
-    const QString root = chatsDir(stateDir);
+    const QString cleanRoot = cleanAbsPath(root);
+    const QString cleanActive = cleanAbsPath(chat.workspace);
     while (chats.size() > kMaxChats) {
         const SavedChat overflow = chats.takeLast();
-        if (isSafeRemovableChatDir(root, overflow.workspace, chat.workspace))
+        if (isSafeRemovableChatDirClean(cleanRoot, cleanAbsPath(overflow.workspace), cleanActive))
             QDir(overflow.workspace).removeRecursively();
     }
 
     const bool ok = save(stateDir, chats);
-    prune(stateDir, chat.workspace);
+    removeOrphanDirs(root, chats, chat.workspace);
     return ok;
 }
 
@@ -215,23 +309,28 @@ std::optional<SavedChat> History::find(const QString &stateDir, const QString &i
     return std::nullopt;
 }
 
-bool History::remove(const QString &stateDir, const QString &id) {
+bool History::remove(const QString &stateDir, const QString &id, QString *removedWorkspace) {
     if (!isValidChatId(id))
         return false;
     QList<SavedChat> chats = load(stateDir);
-    bool removed = false;
-    const QString root = chatsDir(stateDir);
+    QStringList workspacesToDelete;
     for (int i = chats.size() - 1; i >= 0; --i) {
         if (chats.at(i).id != id)
             continue;
-        const SavedChat target = chats.takeAt(i);
-        if (isSafeRemovableChatDir(root, target.workspace, {}))
-            QDir(target.workspace).removeRecursively();
-        removed = true;
+        workspacesToDelete.append(chats.takeAt(i).workspace);
     }
-    if (!removed)
+    if (workspacesToDelete.isEmpty())
         return false;
-    return save(stateDir, chats);
+    if (!save(stateDir, chats))
+        return false;
+    if (removedWorkspace && removedWorkspace->isEmpty())
+        *removedWorkspace = workspacesToDelete.first();
+    const QString cleanRoot = cleanAbsPath(chatsDir(stateDir));
+    for (const QString &workspace : workspacesToDelete) {
+        if (isSafeRemovableChatDirClean(cleanRoot, cleanAbsPath(workspace), {}))
+            QDir(workspace).removeRecursively();
+    }
+    return true;
 }
 
 void History::prune(const QString &stateDir, const QString &activeWorkspace) {
@@ -251,9 +350,11 @@ void History::prune(const QString &stateDir, const QString &activeWorkspace) {
         }
     }
 
+    const QString cleanRoot = cleanAbsPath(root);
+    const QString cleanActive = cleanAbsPath(activeWorkspace);
     while (chats.size() > kMaxChats) {
         const SavedChat overflow = chats.takeLast();
-        if (isSafeRemovableChatDir(root, overflow.workspace, activeWorkspace))
+        if (isSafeRemovableChatDirClean(cleanRoot, cleanAbsPath(overflow.workspace), cleanActive))
             QDir(overflow.workspace).removeRecursively();
         modified = true;
     }
@@ -261,18 +362,6 @@ void History::prune(const QString &stateDir, const QString &activeWorkspace) {
     if (modified && (indexExists || !chats.isEmpty()))
         save(stateDir, chats);
 
-    if (!rootExists)
-        return;
-
-    QSet<QString> kept;
-    for (const SavedChat &chat : chats)
-        kept.insert(QDir::cleanPath(QFileInfo(chat.workspace).absoluteFilePath()));
-    if (!activeWorkspace.isEmpty())
-        kept.insert(QDir::cleanPath(QFileInfo(activeWorkspace).absoluteFilePath()));
-
-    for (const QFileInfo &entry : QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
-        const QString dirPath = QDir::cleanPath(entry.absoluteFilePath());
-        if (!kept.contains(dirPath) && isSafeRemovableChatDir(root, dirPath, activeWorkspace))
-            QDir(dirPath).removeRecursively();
-    }
+    if (rootExists)
+        removeOrphanDirs(root, chats, activeWorkspace);
 }

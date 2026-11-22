@@ -65,7 +65,7 @@ public:
     ~Theme() override;
 
     QString accent() const { return m_colors.accent; }
-    QString accentForeground() const;
+    QString accentForeground() const { return m_accentForeground; }
     int radius() const { return m_radius; }
     bool light() const { return m_colors.light; }
     QString surface() const { return m_colors.surface; }
@@ -100,6 +100,7 @@ private:
 
     QString m_directory;
     Colors m_colors;
+    QString m_accentForeground;
     QString m_monoFont;
     QFileSystemWatcher m_watcher;
     QTimer m_debounce;

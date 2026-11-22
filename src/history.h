@@ -15,6 +15,15 @@ struct SavedChat {
     QList<MessagesModel::Turn> turns;
 };
 
+struct ChatSummary {
+    QString id;
+    QString title;
+    QString workspace;
+    QString model;
+    qint64 updatedAt = 0;
+    int turnCount = 0;
+};
+
 // Persists recent chat metadata in stateDir/chats/index.json and prunes old or
 // orphaned workspace directories so stateDir stays bounded.
 class History {
@@ -25,6 +34,7 @@ public:
     static QString indexPath(const QString &stateDir);
 
     static QList<SavedChat> load(const QString &stateDir);
+    static QList<ChatSummary> loadSummaries(const QString &stateDir);
     static bool save(const QString &stateDir, const QList<SavedChat> &chats);
 
     static bool upsert(const QString &stateDir, SavedChat chat);
@@ -32,6 +42,6 @@ public:
                            const QList<MessagesModel::Turn> &turns, qint64 updatedAt = 0);
 
     static std::optional<SavedChat> find(const QString &stateDir, const QString &id);
-    static bool remove(const QString &stateDir, const QString &id);
+    static bool remove(const QString &stateDir, const QString &id, QString *removedWorkspace = nullptr);
     static void prune(const QString &stateDir, const QString &activeWorkspace = {});
 };

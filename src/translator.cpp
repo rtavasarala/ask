@@ -7,7 +7,60 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocale>
-#include <QRegularExpression>
+#include <cstring>
+
+namespace {
+bool isValidLanguageCode(QStringView code) {
+    const qsizetype n = code.size();
+    qsizetype i = 0;
+    while (i < n && code.at(i).unicode() >= 'a' && code.at(i).unicode() <= 'z')
+        ++i;
+    if (i < 2 || i > 3)
+        return false;
+    if (i == n)
+        return true;
+    if (i + 3 != n || code.at(i) != QLatin1Char('-'))
+        return false;
+    auto isAsciiLetter = [](QChar ch) {
+        const char16_t u = ch.unicode();
+        return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z');
+    };
+    return isAsciiLetter(code.at(i + 1)) && isAsciiLetter(code.at(i + 2));
+}
+
+const char *pluralCategoryKey(const QString &language, long long count) {
+    const long long n = count < 0 ? -count : count, n10 = n % 10, n100 = n % 100;
+    const bool millions = n != 0 && n % 1000000 == 0;
+    const bool teens = n100 >= 12 && n100 <= 14;
+    auto in = [&](std::initializer_list<const char *> codes) {
+        for (const char *c : codes)
+            if (language == QLatin1String(c))
+                return true;
+        return false;
+    };
+    if (in({"ja", "ko", "zh-CN", "zh-TW", "th", "vi", "id", "ms"})) return "other";
+    if (in({"hi", "bn", "fa", "si"})) return n <= 1 ? "one" : "other";
+    if (in({"fr", "pt-BR"})) return n <= 1 ? "one" : millions ? "many" : "other";
+    if (in({"ca", "es-MX", "it", "pt"})) return n == 1 ? "one" : millions ? "many" : "other";
+    if (language == QLatin1String("fil")) return (n10 == 4 || n10 == 6 || n10 == 9) ? "other" : "one";
+    if (language == QLatin1String("is")) return n10 == 1 && n100 != 11 ? "one" : "other";
+    if (in({"cs", "sk"})) return n == 1 ? "one" : n >= 2 && n <= 4 ? "few" : "other";
+    if (language == QLatin1String("pl")) return n == 1 ? "one" : n10 >= 2 && n10 <= 4 && !teens ? "few" : "many";
+    if (in({"ru", "uk"})) return n10 == 1 && n100 != 11 ? "one" : n10 >= 2 && n10 <= 4 && !teens ? "few" : "many";
+    if (in({"hr", "sr"})) return n10 == 1 && n100 != 11 ? "one" : n10 >= 2 && n10 <= 4 && !teens ? "few" : "other";
+    if (language == QLatin1String("sl")) return n100 == 1 ? "one" : n100 == 2 ? "two" : n100 >= 3 && n100 <= 4 ? "few" : "other";
+    if (language == QLatin1String("lt")) return n100 >= 11 && n100 <= 19 ? "other" : n10 == 1 ? "one" : n10 >= 2 ? "few" : "other";
+    if (language == QLatin1String("lv")) return n10 == 0 || (n100 >= 11 && n100 <= 19) ? "zero" : n10 == 1 ? "one" : "other";
+    if (language == QLatin1String("ro")) return n == 1 ? "one" : n == 0 || (n100 >= 1 && n100 <= 19) ? "few" : "other";
+    if (language == QLatin1String("ar")) {
+        if (n <= 2) return n == 0 ? "zero" : n == 1 ? "one" : "two";
+        return n100 >= 3 && n100 <= 10 ? "few" : n100 >= 11 ? "many" : "other";
+    }
+    if (language == QLatin1String("he")) return n == 1 ? "one" : n == 2 ? "two" : "other";
+    if (language == QLatin1String("ga")) return n == 1 ? "one" : n == 2 ? "two" : n >= 3 && n <= 6 ? "few" : n >= 7 && n <= 10 ? "many" : "other";
+    return n == 1 ? "one" : "other";
+}
+}  // namespace
 
 Translator::Translator(const QString &languageFile, const QString &catalogDirectory, QObject *parent)
     : QTranslator(parent),
@@ -25,71 +78,49 @@ Translator::Translator(const QString &languageFile, const QString &catalogDirect
 QString Translator::readLanguage(const QString &path) {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
-        return "en";
+        return QStringLiteral("en");
     const QString code = QString::fromUtf8(file.readLine()).trimmed();
-    static const QRegularExpression valid("^[a-z]{2,3}(-[A-Za-z]{2})?$");
-    return valid.match(code).hasMatch() ? code : "en";
+    return isValidLanguageCode(code) ? code : QStringLiteral("en");
 }
 
 // CLDR cardinal plural categories for whole counts, for Omarchy's languages
 // (the same rules as Omarchy's shell/Commons/Plural.js).
 QString Translator::pluralCategory(const QString &language, long long count) {
-    const long long n = count < 0 ? -count : count, n10 = n % 10, n100 = n % 100;
-    const bool millions = n != 0 && n % 1000000 == 0;
-    const bool teens = n100 >= 12 && n100 <= 14;
-    const QString code = language;
-    auto in = [&](std::initializer_list<const char *> codes) {
-        for (const char *c : codes) if (code == QLatin1String(c)) return true;
-        return false;
-    };
-    if (in({"ja", "ko", "zh-CN", "zh-TW", "th", "vi", "id", "ms"})) return "other";
-    if (in({"hi", "bn", "fa", "si"})) return n <= 1 ? "one" : "other";
-    if (in({"fr", "pt-BR"})) return n <= 1 ? "one" : millions ? "many" : "other";
-    if (in({"ca", "es-MX", "it", "pt"})) return n == 1 ? "one" : millions ? "many" : "other";
-    if (code == "fil") return (n10 == 4 || n10 == 6 || n10 == 9) ? "other" : "one";
-    if (code == "is") return n10 == 1 && n100 != 11 ? "one" : "other";
-    if (in({"cs", "sk"})) return n == 1 ? "one" : n >= 2 && n <= 4 ? "few" : "other";
-    if (code == "pl") return n == 1 ? "one" : n10 >= 2 && n10 <= 4 && !teens ? "few" : "many";
-    if (in({"ru", "uk"})) return n10 == 1 && n100 != 11 ? "one" : n10 >= 2 && n10 <= 4 && !teens ? "few" : "many";
-    if (in({"hr", "sr"})) return n10 == 1 && n100 != 11 ? "one" : n10 >= 2 && n10 <= 4 && !teens ? "few" : "other";
-    if (code == "sl") return n100 == 1 ? "one" : n100 == 2 ? "two" : n100 >= 3 && n100 <= 4 ? "few" : "other";
-    if (code == "lt") return n100 >= 11 && n100 <= 19 ? "other" : n10 == 1 ? "one" : n10 >= 2 ? "few" : "other";
-    if (code == "lv") return n10 == 0 || (n100 >= 11 && n100 <= 19) ? "zero" : n10 == 1 ? "one" : "other";
-    if (code == "ro") return n == 1 ? "one" : n == 0 || (n100 >= 1 && n100 <= 19) ? "few" : "other";
-    if (code == "ar") {
-        if (n <= 2) return n == 0 ? "zero" : n == 1 ? "one" : "two";
-        return n100 >= 3 && n100 <= 10 ? "few" : n100 >= 11 ? "many" : "other";
-    }
-    if (code == "he") return n == 1 ? "one" : n == 2 ? "two" : "other";
-    if (code == "ga") return n == 1 ? "one" : n == 2 ? "two" : n >= 3 && n <= 6 ? "few" : n >= 7 && n <= 10 ? "many" : "other";
-    return n == 1 ? "one" : "other";
+    return QString::fromLatin1(pluralCategoryKey(language, count));
 }
 
 // The locale Omarchy formats this language with, from its registry, so the
 // app's numbers and dates match the desktop's (Arabic there uses Western
 // digits); without Omarchy, Qt's own locale for the code.
 QLocale Translator::formatLocale(const QString &language) {
-    QFile registry(qEnvironmentVariable("OMARCHY_PATH") + "/default/i18n/locales.json");
-    if (registry.open(QIODevice::ReadOnly)) {
-        const QString name = QJsonDocument::fromJson(registry.readAll()).object()
-                                 .value(language).toObject().value("formatLocale").toString();
-        if (!name.isEmpty())
-            return QLocale(name);
+    const QString omarchyPath = qEnvironmentVariable("OMARCHY_PATH");
+    if (!omarchyPath.isEmpty()) {
+        QFile registry(omarchyPath + QStringLiteral("/default/i18n/locales.json"));
+        if (registry.open(QIODevice::ReadOnly)) {
+            const QString name = QJsonDocument::fromJson(registry.readAll()).object()
+                                     .value(language).toObject().value(QLatin1String("formatLocale")).toString();
+            if (!name.isEmpty())
+                return QLocale(name);
+        }
     }
     return QLocale(language);
 }
 
 QString Translator::translate(const char *, const char *sourceText, const char *, int n) const {
-    // A null string tells Qt there is no translation, so it shows the English.
-    const QJsonValue value = m_strings.value(QString::fromUtf8(sourceText));
-    if (value.isString())
-        return value.toString();
-    if (value.isObject()) {
-        const QJsonObject forms = value.toObject();
-        const QString form = forms.value(n < 0 ? "other" : pluralCategory(m_language, n)).toString();
-        return form.isEmpty() ? forms.value("other").toString() : form;
-    }
-    return {};
+    if (!sourceText || m_strings.isEmpty())
+        return {};
+    // Zero-allocation lookup using raw UTF-8 view of the literal key.
+    const QByteArray key = QByteArray::fromRawData(sourceText, qsizetype(std::strlen(sourceText)));
+    const auto it = m_strings.constFind(key);
+    if (it == m_strings.cend())
+        return {};
+    if (it->plurals.isEmpty())
+        return it->text;
+    const char *cat = n < 0 ? "other" : pluralCategoryKey(m_language, n);
+    const auto formIt = it->plurals.constFind(QByteArray::fromRawData(cat, qsizetype(std::strlen(cat))));
+    if (formIt != it->plurals.cend() && !formIt->isEmpty())
+        return *formIt;
+    return it->plurals.value(QByteArrayLiteral("other"));
 }
 
 void Translator::reload() {
@@ -113,21 +144,34 @@ void Translator::reload() {
     // English first (it carries the plural forms of counted strings), then
     // the base language and the regional file over it (pt, then pt-BR), so a
     // missing string falls back toward English one step at a time.
-    QHash<QString, QJsonValue> strings;
-    QStringList codes{"en", language.section('-', 0, 0), language};
+    QHash<QByteArray, Entry> strings;
+    QStringList codes{QStringLiteral("en"), language.section(QLatin1Char('-'), 0, 0), language};
     codes.removeDuplicates();
     for (const auto &code : codes) {
-        QFile catalog(m_catalogDirectory + "/" + code + ".json");
+        QFile catalog(m_catalogDirectory + QLatin1Char('/') + code + QStringLiteral(".json"));
         if (!catalog.open(QIODevice::ReadOnly))
             continue;
         const QJsonObject object = QJsonDocument::fromJson(catalog.readAll()).object();
-        for (auto it = object.begin(); it != object.end(); ++it)
-            if ((it.value().isString() && !it.value().toString().isEmpty()) || it.value().isObject())
-                strings.insert(it.key(), it.value());
+        strings.reserve(strings.size() + object.size());
+        for (auto it = object.begin(); it != object.end(); ++it) {
+            if (it.value().isString()) {
+                const QString text = it.value().toString();
+                if (!text.isEmpty())
+                    strings.insert(it.key().toUtf8(), Entry{text, {}});
+            } else if (it.value().isObject()) {
+                Entry entry;
+                const QJsonObject forms = it.value().toObject();
+                for (auto fit = forms.begin(); fit != forms.end(); ++fit) {
+                    if (fit.value().isString())
+                        entry.plurals.insert(fit.key().toUtf8(), fit.value().toString());
+                }
+                strings.insert(it.key().toUtf8(), std::move(entry));
+            }
+        }
     }
 
     m_language = language;
-    m_strings = strings;
+    m_strings = std::move(strings);
     // Dates, numbers, and Qt's own day and month names follow the language
     // too, and right-to-left languages mirror the window.
     const QLocale locale = formatLocale(language);

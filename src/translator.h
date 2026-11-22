@@ -1,8 +1,8 @@
 #pragma once
 
+#include <QByteArray>
 #include <QFileSystemWatcher>
 #include <QHash>
-#include <QJsonValue>
 #include <QLocale>
 #include <QTimer>
 #include <QTranslator>
@@ -34,12 +34,17 @@ signals:
     void changed();
 
 private:
+    struct Entry {
+        QString text;
+        QHash<QByteArray, QString> plurals;
+    };
+
     void reload();
 
     QString m_languageFile;
     QString m_catalogDirectory;
     QString m_language;
-    QHash<QString, QJsonValue> m_strings;
+    QHash<QByteArray, Entry> m_strings;
     QFileSystemWatcher m_watcher;
     QTimer m_debounce;
 };

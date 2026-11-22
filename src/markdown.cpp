@@ -10,17 +10,11 @@ QString trimSingleTrailingNewline(QString text) {
         text.chop(1);
     return text;
 }
-
-struct FenceOpen {
-    QChar character;
-    int length = 0;
-    int indent = 0;
-    QString language;
-};
+}  // namespace
 
 // CommonMark §4.5: up to 3 leading spaces, 3+ matching backticks or tildes,
 // and no backticks in the info string of a backtick fence.
-bool matchOpeningFence(QStringView line, FenceOpen &out) {
+bool matchOpeningFence(QStringView line, MarkdownFence &out) {
     int indent = 0;
     while (indent < line.size() && indent < 4 && line.at(indent) == QLatin1Char(' '))
         ++indent;
@@ -75,7 +69,6 @@ bool matchClosingFence(QStringView line, QChar fenceChar, int minLength) {
     }
     return true;
 }
-}  // namespace
 
 QList<MarkdownBlock> parseMarkdownBlocks(const QString &markdown) {
     if (markdown.isEmpty())
@@ -85,7 +78,7 @@ QList<MarkdownBlock> parseMarkdownBlocks(const QString &markdown) {
     QString prose;
     QString code;
     bool inCode = false;
-    FenceOpen activeFence;
+    MarkdownFence activeFence;
 
     qsizetype pos = 0;
     while (pos < markdown.size()) {
@@ -98,7 +91,7 @@ QList<MarkdownBlock> parseMarkdownBlocks(const QString &markdown) {
         pos = nl < 0 ? markdown.size() : nl + 1;
 
         if (!inCode) {
-            FenceOpen opened;
+            MarkdownFence opened;
             if (matchOpeningFence(line, opened)) {
                 const QString proseBody = trimSingleTrailingNewline(prose);
                 if (!proseBody.trimmed().isEmpty())

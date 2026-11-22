@@ -353,6 +353,8 @@ int runHeadlessQuery(const ParsedCli &cli, int argc, char *argv[], const QString
 
     QStringDecoder decoder(QStringConverter::Utf8);
     QString answer;
+    bool wroteAny = false;
+    char lastByte = '\0';
     QByteArray stderrBytes;
     bool failedToStart = false;
     int exitCode = 1;
@@ -363,11 +365,12 @@ int runHeadlessQuery(const ParsedCli &cli, int argc, char *argv[], const QString
         const QByteArray bytes = process.readAllStandardOutput();
         if (bytes.isEmpty())
             return;
-        const QString chunk = decoder(bytes);
-        answer += chunk;
-        if (!cli.json) {
-            const QByteArray utf8 = chunk.toUtf8();
-            std::fwrite(utf8.constData(), 1, size_t(utf8.size()), stdout);
+        if (cli.json) {
+            answer += decoder(bytes);
+        } else {
+            wroteAny = true;
+            lastByte = bytes.back();
+            std::fwrite(bytes.constData(), 1, size_t(bytes.size()), stdout);
             std::fflush(stdout);
         }
     };
@@ -415,7 +418,7 @@ int runHeadlessQuery(const ParsedCli &cli, int argc, char *argv[], const QString
         }).toJson(QJsonDocument::Compact) + '\n';
         std::fwrite(payload.constData(), 1, size_t(payload.size()), stdout);
         std::fflush(stdout);
-    } else if (!answer.isEmpty() && !answer.endsWith(QLatin1Char('\n')) && isatty(STDOUT_FILENO)) {
+    } else if (wroteAny && lastByte != '\n' && isatty(STDOUT_FILENO)) {
         std::fwrite("\n", 1, 1, stdout);
         std::fflush(stdout);
     }

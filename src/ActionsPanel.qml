@@ -167,7 +167,7 @@ Item {
             y: sep.y + 1
             width: parent.width
             height: 32
-            readonly property bool showSecondaryHint: root.hasSecondaryAction && root.shown.length > 0 && !root.shown[root.current].disabled
+            readonly property bool showSecondaryHint: root.hasSecondaryAction && root.shown.length > 0 && root.current >= 0 && root.current < root.shown.length && !root.shown[root.current].disabled
 
             TextInput {
                 id: filter

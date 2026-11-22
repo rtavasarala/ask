@@ -11,7 +11,7 @@
 #include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QRegularExpression>
+#include <QStringView>
 #include <algorithm>
 #include <cmath>
 
@@ -22,6 +22,66 @@ constexpr qsizetype kMaxEventBuffer = 64 * 1024;
 double wcagLuminance(const QColor &c) {
     auto linear = [](double v) { return v <= .04045 ? v / 12.92 : std::pow((v + .055) / 1.055, 2.4); };
     return .2126 * linear(c.redF()) + .7152 * linear(c.greenF()) + .0722 * linear(c.blueF());
+}
+
+QString computeAccentForeground(const QString &accent) {
+    return wcagLuminance(QColor(accent)) > .179 ? QStringLiteral("black") : QStringLiteral("white");
+}
+
+bool isHexColor(QStringView s) {
+    if ((s.size() != 7 && s.size() != 9) || s.at(0) != QLatin1Char('#'))
+        return false;
+    for (qsizetype i = 1; i < s.size(); ++i) {
+        const char16_t u = s.at(i).unicode();
+        if (!((u >= '0' && u <= '9') || (u >= 'a' && u <= 'f') || (u >= 'A' && u <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+bool parseTomlKeyValue(QStringView line, QStringView &key, QStringView &val) {
+    const qsizetype n = line.size();
+    qsizetype i = 0;
+    while (i < n && line.at(i).isSpace())
+        ++i;
+    const qsizetype keyStart = i;
+    while (i < n) {
+        const char16_t u = line.at(i).unicode();
+        if ((u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '_')
+            ++i;
+        else
+            break;
+    }
+    if (i == keyStart)
+        return false;
+    const qsizetype keyEnd = i;
+    while (i < n && line.at(i).isSpace())
+        ++i;
+    if (i >= n || line.at(i) != QLatin1Char('='))
+        return false;
+    ++i;
+    while (i < n && line.at(i).isSpace())
+        ++i;
+    if (i >= n)
+        return false;
+    const QChar quote = line.at(i);
+    if (quote != QLatin1Char('"') && quote != QLatin1Char('\''))
+        return false;
+    ++i;
+    const qsizetype valStart = i;
+    while (i < n && line.at(i) != quote)
+        ++i;
+    if (i >= n)
+        return false;
+    const qsizetype valEnd = i;
+    ++i;
+    while (i < n && line.at(i).isSpace())
+        ++i;
+    if (i < n && line.at(i) != QLatin1Char('#'))
+        return false;
+    key = line.mid(keyStart, keyEnd - keyStart);
+    val = line.mid(valStart, valEnd - valStart).trimmed();
+    return true;
 }
 
 double contrastRatio(const QColor &a, const QColor &b) {
@@ -50,7 +110,7 @@ QString resolveMonoFont() {
 Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl)
     : QObject(parent),
       m_directory(directory.isEmpty() ? QDir::homePath() + "/.local/state/omarchy/current" : directory),
-      m_monoFont(resolveMonoFont()),
+      m_accentForeground(computeAccentForeground(m_colors.accent)),
       m_hyprctl(hyprctl) {
     m_debounce.setSingleShot(true);
     m_debounce.setInterval(80);
@@ -209,23 +269,26 @@ Theme::Colors Theme::readColors(const QString &path) {
     if (!file.open(QIODevice::ReadOnly))
         return c;
 
-    static const QRegularExpression kvPattern(
-        QStringLiteral(R"re(^\s*([a-zA-Z0-9_]+)\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$)re"));
-    static const QRegularExpression hexPattern(QStringLiteral("^#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$"));
-
+    const QString content = QString::fromUtf8(file.readAll());
     QHash<QString, QString> raw;
-    const QStringList lines = QString::fromUtf8(file.readAll()).split('\n');
-    for (const QString &line : lines) {
-        const auto match = kvPattern.match(line);
-        if (!match.hasMatch())
-            continue;
-        const QString val = !match.captured(2).isNull() ? match.captured(2).trimmed() : match.captured(3).trimmed();
-        raw.insert(match.captured(1), val);
+    raw.reserve(24);
+    qsizetype pos = 0;
+    while (pos < content.size()) {
+        const qsizetype nl = content.indexOf(QLatin1Char('\n'), pos);
+        QStringView line = nl < 0 ? QStringView(content).mid(pos)
+                                  : QStringView(content).mid(pos, nl - pos);
+        if (line.endsWith(QLatin1Char('\r')))
+            line = line.chopped(1);
+        pos = nl < 0 ? content.size() : nl + 1;
+
+        QStringView key, val;
+        if (parseTomlKeyValue(line, key, val))
+            raw.insert(key.toString(), val.toString());
     }
 
     auto colorValue = [&raw](const char *key) -> QString {
         const QString val = raw.value(QLatin1String(key));
-        return hexPattern.match(val).hasMatch() ? val : QString();
+        return isHexColor(val) ? val : QString();
     };
 
     const QString accent = colorValue("accent");
@@ -327,11 +390,6 @@ Theme::Colors Theme::readColors(const QString &path) {
 
 QString Theme::readAccent(const QString &path) { return readColors(path).accent; }
 
-// Black or white, whichever reads on the accent (WCAG relative luminance).
-QString Theme::accentForeground() const {
-    return wcagLuminance(QColor(m_colors.accent)) > .179 ? QStringLiteral("black") : QStringLiteral("white");
-}
-
 void Theme::reload() {
     refreshRounding();
     if (!m_hyprEventSocket.isEmpty() && m_eventSocket.state() == QLocalSocket::UnconnectedState && !m_eventRetry.isActive())
@@ -357,6 +415,8 @@ void Theme::reload() {
     const Colors colors = readColors(m_directory + "/theme/colors.toml");
     const QString mono = resolveMonoFont();
     if (colors != m_colors || mono != m_monoFont) {
+        if (colors.accent != m_colors.accent)
+            m_accentForeground = computeAccentForeground(colors.accent);
         m_colors = colors;
         m_monoFont = mono;
         emit changed();

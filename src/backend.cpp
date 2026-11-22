@@ -12,6 +12,9 @@
 #include <QProcessEnvironment>
 #include <QSet>
 #include <QWindow>
+#include <cstdint>
+#include <cstring>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 
@@ -25,6 +28,38 @@ bool isEnglishCode(const QString &language) {
     const QString clean = language.trimmed().toLower();
     return clean.isEmpty() || clean == QLatin1String("en")
            || clean.startsWith(QLatin1String("en-")) || clean.startsWith(QLatin1String("en_"));
+}
+
+bool isCompletePng(const QByteArray &data) {
+    static constexpr unsigned char kSig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (data.size() < 8 + 12 + 13 + 12 || std::memcmp(data.constData(), kSig, 8) != 0)
+        return false;
+    auto readBe32 = [&](qsizetype off) -> uint32_t {
+        const auto *p = reinterpret_cast<const unsigned char *>(data.constData() + off);
+        return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    };
+    qsizetype pos = 8;
+    bool sawIhdr = false;
+    bool sawIdat = false;
+    while (pos + 12 <= data.size()) {
+        const uint32_t len = readBe32(pos);
+        if (len > 0x7fffffffU || qsizetype(len) > data.size() - pos - 12)
+            return false;
+        const char *type = data.constData() + pos + 4;
+        if (!sawIhdr) {
+            if (std::memcmp(type, "IHDR", 4) != 0 || len != 13)
+                return false;
+            if (readBe32(pos + 8) == 0 || readBe32(pos + 12) == 0)
+                return false;
+            sawIhdr = true;
+        } else if (std::memcmp(type, "IDAT", 4) == 0) {
+            sawIdat = true;
+        } else if (std::memcmp(type, "IEND", 4) == 0) {
+            return len == 0 && sawIdat;
+        }
+        pos += 12 + qsizetype(len);
+    }
+    return false;
 }
 }
 
@@ -74,6 +109,51 @@ void Backend::setUiLanguage(const QString &lang) {
 void Backend::saveSettings() const {
     if (!m_settingsFile.isEmpty())
         Settings{m_model, m_effort, m_fast}.save(m_settingsFile);
+}
+
+Backend::FileStamp Backend::statFile(const QString &path) {
+    FileStamp stamp;
+    if (path.isEmpty())
+        return stamp;
+    struct stat st{};
+    if (::stat(QFile::encodeName(path).constData(), &st) == 0) {
+        stamp.exists = true;
+        stamp.inode = quint64(st.st_ino);
+        stamp.size = qint64(st.st_size);
+        stamp.mtimeSec = qint64(st.st_mtim.tv_sec);
+        stamp.mtimeNsec = qint64(st.st_mtim.tv_nsec);
+    }
+    return stamp;
+}
+
+const QList<AiCommand> &Backend::customCommands() const {
+    if (m_paths.commandsFile.isEmpty()) {
+        static const QList<AiCommand> kEmpty;
+        return kEmpty;
+    }
+    const FileStamp stamp = statFile(m_paths.commandsFile);
+    if (!m_hasCachedCommands || stamp != m_cachedCommandsStamp) {
+        m_cachedCommands = stamp.exists ? loadCustomCommands(m_paths.commandsFile) : QList<AiCommand>{};
+        m_cachedCommandsStamp = stamp;
+        m_hasCachedCommands = true;
+    }
+    return m_cachedCommands;
+}
+
+void Backend::resetChatState() {
+    if (m_status == Running)
+        stop();
+    m_pendingOutput.clear();
+    m_flushTimer.stop();
+    release(std::exchange(m_inFlightAttachments, {}));
+    m_messages.clear();
+    m_workspace.clear();
+    release(m_attachments.clear());
+    if (m_canResume) {
+        m_canResume = false;
+        emit canResumeChanged();
+    }
+    setStatus(Idle);
 }
 
 bool Backend::ensureRuntimeDir() {
@@ -266,6 +346,7 @@ void Backend::finished(QProcess *process, int code, QProcess::ExitStatus exit, c
         }
         History::recordChat(m_stateDir, m_workspace, m_model, m_messages.turns());
         m_prunedOnStartup = true;
+        m_hasCachedChats = false;
         emit historyChanged();
         setStatus(Idle);
     } else {
@@ -311,19 +392,7 @@ void Backend::stop() {
 }
 
 void Backend::newChat() {
-    if (m_status == Running)
-        stop();
-    m_pendingOutput.clear();
-    m_flushTimer.stop();
-    release(std::exchange(m_inFlightAttachments, {}));
-    m_messages.clear();
-    m_workspace.clear();
-    release(m_attachments.clear());
-    if (m_canResume) {
-        m_canResume = false;
-        emit canResumeChanged();
-    }
-    setStatus(Idle);
+    resetChatState();
     emit historyChanged();
 }
 
@@ -400,7 +469,7 @@ bool Backend::runCommand(const QString &id) {
         return send(command->promptTemplate);
     }
     if (!m_paths.commandsFile.isEmpty()) {
-        for (const AiCommand &custom : loadCustomCommands(m_paths.commandsFile)) {
+        for (const AiCommand &custom : customCommands()) {
             if (custom.id != id)
                 continue;
             if (custom.requiresSelection && !m_attachments.hasEnabledSelection())
@@ -446,7 +515,7 @@ QVariantList Backend::commandsForLanguage(const QString &language) const {
     }
 
     if (!m_paths.commandsFile.isEmpty()) {
-        for (const AiCommand &custom : loadCustomCommands(m_paths.commandsFile)) {
+        for (const AiCommand &custom : customCommands()) {
             if (custom.id.isEmpty() || seen.contains(custom.id))
                 continue;
             seen.insert(custom.id);
@@ -678,10 +747,30 @@ bool Backend::pasteImage() {
     // Text wins: copying text from an app that also offers an image must paste text.
     if (!mime || !mime->hasImage() || mime->hasText())
         return false;
-    const QImage image = qvariant_cast<QImage>(mime->imageData());
     const QString path = newRuntimeFile("paste", "png");
-    if (image.isNull() || path.isEmpty() || !image.save(path, "PNG"))
+    if (path.isEmpty())
         return false;
+
+    bool saved = false;
+    if (mime->hasFormat(QStringLiteral("image/png"))) {
+        const QByteArray png = mime->data(QStringLiteral("image/png"));
+        if (isCompletePng(png)) {
+            QFile file(path);
+            if (file.open(QIODevice::WriteOnly)) {
+                saved = file.write(png) == png.size() && file.flush();
+                file.close();
+                if (!saved)
+                    QFile::remove(path);
+            }
+        }
+    }
+    if (!saved) {
+        const QImage image = qvariant_cast<QImage>(mime->imageData());
+        if (image.isNull() || !image.save(path, "PNG", 90)) {
+            QFile::remove(path);
+            return false;
+        }
+    }
     QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner);
     Attachment a;
     a.kind = Attachment::Image;
@@ -715,11 +804,14 @@ int Backend::addImageFiles(const QList<QUrl> &urls) {
     int added = 0;
     for (const QUrl &url : urls) {
         const QString path = url.toLocalFile();
-        if (path.isEmpty() || !QFileInfo(path).isFile() || !QImageReader(path).canRead())
+        if (path.isEmpty())
+            continue;
+        const QFileInfo info(path);
+        if (!info.isFile() || !QImageReader(path).canRead())
             continue;
         Attachment a;
         a.kind = Attachment::Image;
-        a.label = QFileInfo(path).fileName();
+        a.label = info.fileName();
         a.tooltip = path;
         a.payload = path;
         m_attachments.add(a);
@@ -877,10 +969,20 @@ QVariantList Backend::recentChats() const {
     if (!m_prunedOnStartup) {
         m_prunedOnStartup = true;
         History::prune(m_stateDir, m_workspace);
+        m_hasCachedChats = false;
     }
+    const QString indexFile = History::indexPath(m_stateDir);
+    const FileStamp stamp = statFile(indexFile);
+    if (!m_hasCachedChats || stamp != m_cachedChatsStamp) {
+        m_cachedChats = stamp.exists ? History::loadSummaries(m_stateDir) : QList<ChatSummary>{};
+        m_cachedChatsStamp = stamp;
+        m_hasCachedChats = true;
+    }
+
     const QString cleanActive = m_workspace.isEmpty() ? QString() : QDir::cleanPath(m_workspace);
     QVariantList list;
-    for (const SavedChat &chat : History::load(m_stateDir)) {
+    list.reserve(m_cachedChats.size());
+    for (const ChatSummary &chat : m_cachedChats) {
         list << QVariantMap{
             {"id", chat.id},
             {"title", chat.title},
@@ -888,7 +990,7 @@ QVariantList Backend::recentChats() const {
             {"modelLabel", chat.model.isEmpty() ? QString() : shortModelName(chat.model)},
             {"updatedAt", chat.updatedAt},
             {"active", !cleanActive.isEmpty() && QDir::cleanPath(chat.workspace) == cleanActive},
-            {"turnCount", int(chat.turns.size())},
+            {"turnCount", chat.turnCount},
         };
     }
     return list;
@@ -917,12 +1019,15 @@ bool Backend::loadChat(const QString &id) {
 }
 
 bool Backend::deleteChat(const QString &id) {
-    const auto saved = History::find(m_stateDir, id);
-    if (!saved)
+    QString removedWorkspace;
+    const bool ok = History::remove(m_stateDir, id, &removedWorkspace);
+    if (!ok)
         return false;
-    if (!m_workspace.isEmpty() && QDir::cleanPath(saved->workspace) == QDir::cleanPath(m_workspace))
-        newChat();
-    const bool ok = History::remove(m_stateDir, id);
+    m_hasCachedChats = false;
+    if (!removedWorkspace.isEmpty() && !m_workspace.isEmpty()
+        && QDir::cleanPath(removedWorkspace) == QDir::cleanPath(m_workspace)) {
+        resetChatState();
+    }
     emit historyChanged();
-    return ok;
+    return true;
 }

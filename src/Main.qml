@@ -20,6 +20,8 @@ Window {
     property string panelMode: "actions"
     readonly property bool commandMode: backend.attachments.hasEnabledSelection
     readonly property var commandList: {
+        if (!commandMode && !(actionsOpen && panelMode === "actions"))
+            return []
         translator.language
         return backend.commandsForLanguage ? backend.commandsForLanguage(translator.language) : backend.commands()
     }
@@ -76,6 +78,8 @@ Window {
                                                     : qsTr("Ask a question and the answer streams in here.")
 
     readonly property var actionItems: {
+        if (!win.actionsOpen || win.panelMode !== "actions")
+            return []
         const items = []
         if (running)
             items.push({id: "stop", label: qsTr("Stop Generating"), keys: ["Esc"]})
@@ -110,6 +114,8 @@ Window {
     }
 
     readonly property var modelItems: {
+        if (!win.actionsOpen || win.panelMode !== "models")
+            return []
         const items = [{id: "model:", label: qsTr("Default (fx)"), keys: [], checked: backend.model === ""}]
         if (backend.modelsState === Backend.ModelsLoading)
             items.push({id: "wait", label: qsTr("Loading models…"), keys: [], disabled: true})
@@ -137,6 +143,8 @@ Window {
     }
 
     readonly property var effortItems: {
+        if (!win.actionsOpen || win.panelMode !== "efforts")
+            return []
         const items = [{id: "effort:", label: qsTr("Default effort"), keys: [], checked: !backend.effort}]
         const levels = backend.availableEfforts || []
         for (const lvl of levels)
@@ -145,6 +153,8 @@ Window {
     }
 
     readonly property var historyItems: {
+        if (!win.actionsOpen || win.panelMode !== "history")
+            return []
         const chats = backend.recentChats || []
         if (chats.length === 0)
             return [{id: "noop", label: qsTr("No saved chats yet"), keys: [], disabled: true}]
@@ -450,9 +460,9 @@ Window {
                             x: Palette.unit * 2.5
                             width: parent.width - Palette.unit * 5
                             kind: model.role
-                            raw: model.text
-                            markdown: model.display
-                            blocks: model.blocks
+                            raw: model.role === "user" ? model.text : ""
+                            blocksModel: model.blocksModel
+                            hasText: model.hasText
                             phase: model.state
                             note: model.note
                             error: backend.errorText

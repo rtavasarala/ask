@@ -169,7 +169,7 @@ void Instance::handle(QLocalSocket *socket) {
                 const QJsonValue value = object.value("context");
                 std::optional<Context> context;
                 if (value.isObject())
-                    context = Context::fromJson(QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact));
+                    context = Context::fromJsonObject(value.toObject());
                 finishPending(std::move(context));
                 return;
             } else {
@@ -207,7 +207,7 @@ Instance::Outcome Instance::toggleRunning(const std::function<Context()> &gather
     if (answer != "need-context")
         return Pinged;
     const Context context = gather ? gather() : Context{};
-    socket.write(line({{"cmd", "context"}, {"context", QJsonDocument::fromJson(context.toJson()).object()}}));
+    socket.write(line({{"cmd", "context"}, {"context", context.toJsonObject()}}));
     socket.waitForBytesWritten(300);
     return Showed;
 }
@@ -236,7 +236,7 @@ Instance::Outcome Instance::sendRequest(const Request &request, const std::funct
     if (answer != "need-context")
         return Pinged;
     const Context context = gather ? gather() : Context{};
-    socket.write(line({{"cmd", "context"}, {"context", QJsonDocument::fromJson(context.toJson()).object()}}));
+    socket.write(line({{"cmd", "context"}, {"context", context.toJsonObject()}}));
     socket.waitForBytesWritten(300);
     return Showed;
 }
