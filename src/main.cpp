@@ -2,6 +2,7 @@
 
 #include <QDateTime>
 #include <QElapsedTimer>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QIcon>
 #include <QMetaObject>
@@ -11,14 +12,16 @@
 #include <QQuickWindow>
 #include <QUrl>
 #include <cstdio>
-#include <cstring>
 #include <functional>
 #include <memory>
 #include <utility>
 
 #include "backend.h"
+#include "cli.h"
+#include "commands.h"
 #include "context.h"
 #include "instance.h"
+#include "overlay.h"
 #include "settings.h"
 #include "theme.h"
 #include "translator.h"
@@ -57,36 +60,66 @@ int main(int argc, char *argv[]) {
     startup.start();
     tracing = qEnvironmentVariableIntValue("ASK_TRACE") != 0;
 
-    bool background = false;
-    for (int i = 1; i < argc; ++i)
-        if (!std::strcmp(argv[i], "--background"))
-            background = true;
+    const ParsedCli cli = parseCli(argc, argv);
+    if (cli.mode == ParsedCli::PrintHelp) {
+        const QByteArray help = cliHelpText().toUtf8();
+        std::fwrite(help.constData(), 1, size_t(help.size()), stdout);
+        return 0;
+    }
+    if (cli.mode == ParsedCli::PrintVersion) {
+        std::puts("ask 0.3.0");
+        return 0;
+    }
+    if (cli.mode == ParsedCli::Error) {
+        const QByteArray err = (QStringLiteral("ask: ") + cli.error + QLatin1Char('\n')).toUtf8();
+        std::fwrite(err.constData(), 1, size_t(err.size()), stderr);
+        return 2;
+    }
+    if (cli.mode == ParsedCli::QueryHeadless)
+        return runHeadlessQuery(cli, argc, argv);
+
+    auto gatherWithTrace = [] {
+        QElapsedTimer gathering;
+        gathering.start();
+        const Context context = Context::gather();
+        trace("context gathered", gathering.elapsed());
+        return context;
+    };
+
+    Instance::Request initialRequest;
+    if (cli.mode == ParsedCli::OpenGui) {
+        initialRequest.prompt = cli.prompt;
+        initialRequest.commandId = cli.commandId;
+        initialRequest.newChat = cli.newChat;
+        for (const QString &file : cli.files)
+            initialRequest.files << QFileInfo(file).absoluteFilePath();
+        initialRequest.model = cli.model;
+        initialRequest.effort = cli.effort;
+        initialRequest.fast = cli.fast;
+    }
 
     // Before the GUI exists, so a hotkey press that lands on a warm process
-    // costs a socket round trip and no platform plugin. `--background` only
+    // costs one socket round trip and no platform plugin. `--background` only
     // pings: autostarting twice must not toggle the window.
     Instance instance;
     std::optional<Context> initial;
-    if (background) {
+    if (cli.mode == ParsedCli::BackgroundGui) {
         if (instance.pingRunning())
             return 0;
+    } else if (cli.mode == ParsedCli::OpenGui) {
+        if (instance.sendRequest(initialRequest, gatherWithTrace) != Instance::NotRunning)
+            return 0;
+        initial = gatherWithTrace();
     } else {
-        const auto outcome = instance.toggleRunning([] {
-            QElapsedTimer gathering;
-            gathering.start();
-            const Context context = Context::gather();
-            trace("context gathered", gathering.elapsed());
-            return context;
-        });
-        if (outcome != Instance::NotRunning)
+        if (instance.toggleRunning(gatherWithTrace) != Instance::NotRunning)
             return 0;
         // First launch: we are the instance, and the window has not stolen focus yet.
-        initial = Context::gather();
+        initial = gatherWithTrace();
     }
 
     QGuiApplication app(argc, argv);
     app.setApplicationName("ask");
-    app.setApplicationVersion("0.2.0");
+    app.setApplicationVersion("0.3.0");
     // Hiding the window keeps the conversation and the warm process.
     app.setQuitOnLastWindowClosed(false);
     app.setDesktopFileName("ask");
@@ -97,10 +130,16 @@ int main(int argc, char *argv[]) {
     Translator translator;
     app.installTranslator(&translator);
 
+    instance.setContextGatherer(gatherWithTrace);
     instance.listen();
 
     Theme theme;
-    Backend backend({}, {}, Backend::Paths().withSettings(Settings::defaultPath()));
+    Backend backend({}, {}, Backend::Paths().withSettings(Settings::defaultPath()).withCommands(defaultCommandsPath()));
+    backend.setUiLanguage(translator.language());
+    QObject::connect(&translator, &Translator::changed, &backend, [&translator, &backend] {
+        backend.setUiLanguage(translator.language());
+    });
+
     qmlRegisterSingletonType(QUrl("qrc:/Palette.qml"), "Ask", 1, 0, "Palette");
     qmlRegisterUncreatableType<Backend>("Ask", 1, 0, "Backend", "Backend is provided by the application");
 
@@ -117,15 +156,49 @@ int main(int argc, char *argv[]) {
         return 1;
     trace("qml loaded", startup.elapsed());
 
+    Overlay::configureWindow(window);
+
     auto present = [window] {
+        Overlay::prepareForShow(window);
         window->show();
         window->raise();
         window->requestActivate();
         QMetaObject::invokeMethod(window, "focusInput");
     };
 
+    auto applyRequest = [&backend, window](const std::optional<Context> &context, const Instance::Request &req) {
+        if (req.newChat)
+            backend.newChat();
+        if (context.has_value())
+            backend.applyContext(context);
+        if (!req.model.isEmpty())
+            backend.setModel(req.model);
+        if (!req.effort.isEmpty())
+            backend.setEffort(req.effort);
+        if (req.fast)
+            backend.setFast(true);
+        if (!req.files.isEmpty()) {
+            QList<QUrl> urls;
+            for (const QString &path : req.files)
+                urls << QUrl::fromLocalFile(path);
+            backend.addFiles(urls);
+        }
+        if (!req.commandId.isEmpty()) {
+            if (!backend.runCommand(req.commandId) && !req.prompt.isEmpty())
+                backend.send(req.prompt);
+        } else if (!req.prompt.isEmpty()) {
+            if (!backend.send(req.prompt)) {
+                if (auto *input = window->findChild<QObject *>("input"))
+                    input->setProperty("text", req.prompt);
+            }
+        }
+    };
+
     if (tracing)
         afterNextFrame(window, [] { trace("first frame", startup.elapsed()); });
+
+    QObject::connect(&backend, &Backend::hideWindowRequested, window, [window] { window->hide(); });
+    QObject::connect(&backend, &Backend::showWindowRequested, window, [present] { present(); });
 
     instance.setVisibleProbe([window] { return window->isVisible(); });
     QObject::connect(&instance, &Instance::hideRequested, window, [window] {
@@ -143,11 +216,19 @@ int main(int argc, char *argv[]) {
             });
         present();
     });
+    QObject::connect(&instance, &Instance::requestReceived, window,
+                     [present, applyRequest](const std::optional<Context> &context, const Instance::Request &req) {
+                         applyRequest(context, req);
+                         present();
+                     });
 
     // Created but not shown, so the first toggle pays for as little as possible.
-    if (background)
+    if (cli.mode == ParsedCli::BackgroundGui) {
         window->create();
-    else {
+    } else if (cli.mode == ParsedCli::OpenGui) {
+        applyRequest(initial, initialRequest);
+        present();
+    } else {
         backend.applyContext(initial);
         present();
     }

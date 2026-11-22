@@ -8,16 +8,19 @@ These are not bundled or linked. Ask starts them as external commands, so their 
 
 | Software | Used for | Author | License |
 | --- | --- | --- | --- |
-| [fx](https://github.com/vercel-labs/fx) | Runs every question (`fx ask`) and lists models (`fx models`) | Vercel Labs | Apache-2.0, [LICENSE](https://github.com/vercel-labs/fx/blob/main/LICENSE) |
-| [grim](https://gitlab.freedesktop.org/emersion/grim) | Captures a single window (`grim -T`) | Simon Ser | MIT |
+| [fx](https://github.com/vercel-labs/fx) | Runs every question (`fx ask`) and lists models (`fx models --json`) | Vercel Labs | Apache-2.0, [LICENSE](https://github.com/vercel-labs/fx/blob/main/LICENSE) |
+| [grim](https://gitlab.freedesktop.org/emersion/grim) | Captures a single window (`grim -T`) or selected region (`grim -g`) | Simon Ser | MIT |
+| [slurp](https://github.com/emersion/slurp) | Selects a screen region for region capture | Simon Ser | MIT |
 | [wl-clipboard](https://github.com/bugaevc/wl-clipboard) | Reads the primary selection (`wl-paste --primary`) | Sergey Bugaev and contributors | GPL-3.0-or-later |
-| [Hyprland](https://github.com/hyprwm/Hyprland) | Names the active window through its IPC socket and `hyprctl`; Ask reads its rounding setting | The Hyprland contributors (hyprwm) | BSD-3-Clause |
+| [xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/) | Opens the native file chooser over D-Bus (`org.freedesktop.portal.FileChooser`) | Flatpak / freedesktop.org contributors | LGPL-2.1-or-later |
+| [Hyprland](https://github.com/hyprwm/Hyprland) | Names the active window and reports its rounding setting over Hyprland's IPC sockets | The Hyprland contributors (hyprwm) | BSD-3-Clause |
 
 ## Linked libraries
 
 | Software | Used for | Author | License |
 | --- | --- | --- | --- |
-| [Qt 6](https://www.qt.io/) (Core, Gui, Qml, Quick, Quick Controls 2, Network) | The application, dynamically linked from the system package | The Qt Company and contributors | LGPL-3.0. Because Ask links Qt dynamically, you can replace Qt with another compatible build. |
+| [Qt 6](https://www.qt.io/) (Core, Gui, Qml, Quick, Quick Controls 2, Network, DBus) | The application, dynamically linked from the system package | The Qt Company and contributors | LGPL-3.0. Because Ask links Qt dynamically, you can replace Qt with another compatible build. |
+| [layer-shell-qt](https://invent.kde.org/plasma/layer-shell-qt) | Places the popup on Wayland's `wlr-layer-shell` overlay layer | KDE contributors | LGPL-3.0-or-later |
 
 ## Omarchy
 
