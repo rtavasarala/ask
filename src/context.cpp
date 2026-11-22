@@ -75,7 +75,6 @@ QString collectPrimarySelection(QProcess &process, const QElapsedTimer &timer, i
 
     QByteArray raw;
     bool timedOut = false;
-    bool probedZero = false;
     while (raw.size() < maxBytes) {
         if (process.bytesAvailable() > 0) {
             raw += process.read(maxBytes - raw.size());
@@ -83,14 +82,8 @@ QString collectPrimarySelection(QProcess &process, const QElapsedTimer &timer, i
         }
         if (process.state() == QProcess::NotRunning)
             break;
-        const int remaining = timeoutMs - static_cast<int>(timer.elapsed());
-        if (remaining <= 0 && probedZero) {
-            timedOut = true;
-            break;
-        }
-        if (remaining <= 0)
-            probedZero = true;
-        if (!process.waitForReadyRead(std::max(0, remaining))) {
+        const int remaining = std::max(0, timeoutMs - static_cast<int>(timer.elapsed()));
+        if (!process.waitForReadyRead(remaining)) {
             // Pipe EOF can arrive just before the child is reaped; let any remaining budget collect exitCode.
             const int left = std::max(0, timeoutMs - static_cast<int>(timer.elapsed()));
             if (process.state() != QProcess::NotRunning && !process.waitForFinished(left))

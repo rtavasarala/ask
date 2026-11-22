@@ -313,21 +313,24 @@ bool History::remove(const QString &stateDir, const QString &id, QString *remove
     if (!isValidChatId(id))
         return false;
     QList<SavedChat> chats = load(stateDir);
-    bool removed = false;
-    const QString cleanRoot = cleanAbsPath(chatsDir(stateDir));
+    QStringList workspacesToDelete;
     for (int i = chats.size() - 1; i >= 0; --i) {
         if (chats.at(i).id != id)
             continue;
-        const SavedChat target = chats.takeAt(i);
-        if (removedWorkspace && removedWorkspace->isEmpty())
-            *removedWorkspace = target.workspace;
-        if (isSafeRemovableChatDirClean(cleanRoot, cleanAbsPath(target.workspace), {}))
-            QDir(target.workspace).removeRecursively();
-        removed = true;
+        workspacesToDelete.append(chats.takeAt(i).workspace);
     }
-    if (!removed)
+    if (workspacesToDelete.isEmpty())
         return false;
-    return save(stateDir, chats);
+    if (!save(stateDir, chats))
+        return false;
+    if (removedWorkspace && removedWorkspace->isEmpty())
+        *removedWorkspace = workspacesToDelete.first();
+    const QString cleanRoot = cleanAbsPath(chatsDir(stateDir));
+    for (const QString &workspace : workspacesToDelete) {
+        if (isSafeRemovableChatDirClean(cleanRoot, cleanAbsPath(workspace), {}))
+            QDir(workspace).removeRecursively();
+    }
+    return true;
 }
 
 void History::prune(const QString &stateDir, const QString &activeWorkspace) {

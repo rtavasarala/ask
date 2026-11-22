@@ -157,7 +157,6 @@ private:
     void restoreInFlight();
     void release(const QList<Attachment> &attachments);
     void saveSettings() const;
-    QString resolveFx() const;
     const QList<AiCommand> &customCommands() const;
     void resetChatState();
 
@@ -177,7 +176,6 @@ private:
     static FileStamp statFile(const QString &path);
 
     QString m_fxPath, m_stateDir, m_workspace, m_grim, m_slurp, m_runtimeDir, m_settingsFile;
-    mutable QString m_resolvedFx;
     Paths m_paths;
     MessagesModel m_messages;
     AttachmentsModel m_attachments;

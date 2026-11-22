@@ -12,6 +12,8 @@
 #include <QProcessEnvironment>
 #include <QSet>
 #include <QWindow>
+#include <cstdint>
+#include <cstring>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
@@ -26,6 +28,38 @@ bool isEnglishCode(const QString &language) {
     const QString clean = language.trimmed().toLower();
     return clean.isEmpty() || clean == QLatin1String("en")
            || clean.startsWith(QLatin1String("en-")) || clean.startsWith(QLatin1String("en_"));
+}
+
+bool isCompletePng(const QByteArray &data) {
+    static constexpr unsigned char kSig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (data.size() < 8 + 12 + 13 + 12 || std::memcmp(data.constData(), kSig, 8) != 0)
+        return false;
+    auto readBe32 = [&](qsizetype off) -> uint32_t {
+        const auto *p = reinterpret_cast<const unsigned char *>(data.constData() + off);
+        return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    };
+    qsizetype pos = 8;
+    bool sawIhdr = false;
+    bool sawIdat = false;
+    while (pos + 12 <= data.size()) {
+        const uint32_t len = readBe32(pos);
+        if (len > 0x7fffffffU || qsizetype(len) > data.size() - pos - 12)
+            return false;
+        const char *type = data.constData() + pos + 4;
+        if (!sawIhdr) {
+            if (std::memcmp(type, "IHDR", 4) != 0 || len != 13)
+                return false;
+            if (readBe32(pos + 8) == 0 || readBe32(pos + 12) == 0)
+                return false;
+            sawIhdr = true;
+        } else if (std::memcmp(type, "IDAT", 4) == 0) {
+            sawIdat = true;
+        } else if (std::memcmp(type, "IEND", 4) == 0) {
+            return len == 0 && sawIdat;
+        }
+        pos += 12 + qsizetype(len);
+    }
+    return false;
 }
 }
 
@@ -90,15 +124,6 @@ Backend::FileStamp Backend::statFile(const QString &path) {
         stamp.mtimeNsec = qint64(st.st_mtim.tv_nsec);
     }
     return stamp;
-}
-
-QString Backend::resolveFx() const {
-    if (!m_fxPath.isEmpty())
-        return m_fxPath;
-    if (!m_resolvedFx.isEmpty() && QFileInfo(m_resolvedFx).isExecutable())
-        return m_resolvedFx;
-    m_resolvedFx = resolveFxExecutable();
-    return m_resolvedFx;
 }
 
 const QList<AiCommand> &Backend::customCommands() const {
@@ -224,7 +249,7 @@ bool Backend::send(const QString &prompt) {
     m_messages.append("assistant", {}, "streaming");
 
     // Resolved at send time so installing fx while Ask is resident works.
-    const QString fx = resolveFx();
+    const QString fx = m_fxPath.isEmpty() ? resolveFxExecutable() : m_fxPath;
     if (fx.isEmpty()) {
         m_messages.setLastState("failed");
         setStatus(Failed, tr("fx is not installed or not on PATH. Install it from https://fx.sh and try again."));
@@ -727,10 +752,9 @@ bool Backend::pasteImage() {
         return false;
 
     bool saved = false;
-    static const QByteArray kPngMagic("\x89PNG\r\n\x1a\n", 8);
     if (mime->hasFormat(QStringLiteral("image/png"))) {
         const QByteArray png = mime->data(QStringLiteral("image/png"));
-        if (png.size() >= kPngMagic.size() && png.startsWith(kPngMagic)) {
+        if (isCompletePng(png)) {
             QFile file(path);
             if (file.open(QIODevice::WriteOnly)) {
                 saved = file.write(png) == png.size() && file.flush();
@@ -861,7 +885,7 @@ bool Backend::supportsFast() const {
 void Backend::loadModels() {
     if (m_modelsState == ModelsLoading || m_modelsState == ModelsReady)
         return;
-    const QString fx = resolveFx();
+    const QString fx = m_fxPath.isEmpty() ? resolveFxExecutable() : m_fxPath;
     m_modelsState = ModelsLoading;
     emit modelsChanged();
 
